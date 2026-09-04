@@ -153,6 +153,53 @@ Il file di log viene salvato automaticamente dal workflow di monitoraggio
 (non serve crearlo a mano); viene anche "ripulito" periodicamente,
 scartando le previsioni risolte più vecchie di 120 giorni.
 
+### Segnali ripetuti nello stesso giorno: "aggiornamento", non duplicato
+
+Se un titolo (watchlist o scouting) supera di nuovo la soglia più volte
+nello stesso giorno di borsa, solo la **prima occorrenza** genera una
+previsione nuova da tracciare. Le occorrenze successive nello stesso giorno
+diventano un messaggio "🔄 Aggiornamento": mostrano il prezzo attuale e la
+variazione rispetto al primo segnale, ma **non creano una seconda
+previsione** — quella originale (direzione, prezzo di riferimento) resta
+l'unica usata per il report di autovalutazione. Questo evita sia lo spam
+di alert quasi identici sia la distorsione delle statistiche di accuratezza
+(che altrimenti conterebbero più volte lo stesso movimento di mercato).
+
+### Schema del log (per analisi future)
+
+Ogni voce dello storico include, oltre a direzione/prezzo/esito:
+- `factors`: elenco strutturato `{code, direction}` dei fattori specifici
+  che hanno contribuito (es. `price_1d`, `volume`, `sma_cross`, `news`),
+  utile in futuro per capire quali fattori sono più affidabili di altri
+- `update_count`, `last_update_at`, `last_update_price`: tracciano quante
+  volte un segnale si è "ripetuto" in giornata e con quale prezzo più recente
+
+### Prezzo istantaneo e doppia variazione (correzione pre/after-market)
+
+**Problema risolto**: i dati storici a barre (`tk.history()`), senza
+l'opzione `prepost=True`, NON includono le contrattazioni pre-market e
+after-hours — il prezzo restava quindi "congelato" all'ultima chiusura di
+sessione regolare finché il mercato non riapriva, e gli alert generati in
+quelle fasce orarie mostravano un prezzo non aggiornato.
+
+**Correzione**: il prezzo mostrato nei messaggi ora viene recuperato
+dall'endpoint di **quotazione** di Yahoo Finance (non quello storico), che
+espone il campo `marketState` (PRE/REGULAR/POST) insieme ai prezzi
+specifici di ciascuna fase — pre-market, after-hours o sessione regolare —
+usando sempre quello del segmento effettivamente in corso.
+
+Ogni messaggio ora mostra **due variazioni distinte**:
+- **Variazione da apertura**: rispetto al prezzo di apertura della sessione
+  regolare odierna (presente sia nel primo segnale che negli aggiornamenti)
+- **Variazione dall'ultimo rilevamento**: solo negli aggiornamenti, rispetto
+  all'ultima volta che quel titolo è stato analizzato in giornata (l'ultimo
+  aggiornamento se ce n'è già stato uno, altrimenti il primo segnale) — è un
+  confronto "incrementale", non cumulato dall'inizio della giornata
+
+Se la quotazione istantanea non fosse disponibile per qualche motivo (rete,
+ticker non riconosciuto), il bot ripiega automaticamente sul prezzo dei dati
+storici, con un avviso nei log dell'esecuzione.
+
 ## 7. Attiva entrambi i workflow
 
 1. Vai nella tab **Actions** del repository.
@@ -209,3 +256,32 @@ Riceverai inoltre, separatamente:
   gas o metalli (indipendenti dai singoli titoli)
 - Un **📊 Report di autovalutazione** una volta al giorno, con le
   statistiche di accuratezza delle previsioni degli ultimi 1 e 7 giorni
+
+## Roadmap (idee per il futuro, non ancora implementate)
+
+Idee discusse e tenute da parte per non perderle, da valutare quando si
+vorrà svilupparle:
+
+- **Aggiornamenti ravvicinati sui titoli attivi in giornata**: oltre al
+  meccanismo di "aggiornamento" già presente (che scatta solo se il titolo
+  ri-supera la soglia della checklist), inviare un aggiornamento periodico
+  sulla fluttuazione di prezzo (es. ogni 5 minuti) per i titoli con un
+  alert attivo in giornata, anche senza un nuovo superamento soglia. Punti
+  da definire prima di implementarla: per quanto tempo tenere un titolo
+  "sotto osservazione ravvicinata" dopo l'alert iniziale (fino a chiusura
+  mercato? un numero fisso di ore?) e come evitare che diventi eccessivo
+  se il titolo resta volatile tutto il giorno.
+
+- **Agente di analisi delle performance**: uno script/report che legga lo
+  storico e lo scomponga per fattore attivato (usando il campo `factors`,
+  già presente nello schema), direzione e provenienza (watchlist/scouting),
+  da portare in una conversazione con Claude per discutere eventuali
+  modifiche alle soglie o ai fattori della checklist. Limiti da tenere
+  presente quando lo si userà: con il volume di alert di uno strumento
+  personale, servono probabilmente settimane/mesi di dati prima che una
+  scomposizione per fattore sia statisticamente significativa (un buon
+  report dovrebbe sempre mostrare anche la dimensione del campione, non
+  solo la percentuale); inoltre questo tipo di analisi è ragionamento
+  euristico su dati osservati live, non un backtest rigoroso su storico —
+  per quello servirebbe un esercizio diverso (simulare le regole su dati
+  passati, non osservare gli esiti via via che arrivano).

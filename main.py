@@ -137,6 +137,41 @@ def scout_top_movers(cfg: dict) -> list:
     return top_tickers
 
 
+def get_instant_quote(ticker: str):
+    """Recupera un prezzo il più possibile "istantaneo" per il ticker.
+
+    A differenza di tk.history(), che senza prepost=True NON include
+    pre-market/after-hours (il prezzo resta "congelato" all'ultima chiusura
+    di sessione regolare finché il mercato non riapre), qui interroghiamo
+    l'endpoint di QUOTAZIONE di Yahoo Finance, che espone separatamente:
+      - marketState: "PRE" / "REGULAR" / "POST" / "POSTPOST" / "CLOSED"
+      - preMarketPrice / postMarketPrice / regularMarketPrice
+
+    Usiamo il prezzo del segmento di mercato effettivamente in corso ora.
+    Restituisce None se non riusciamo a recuperare nulla (chi chiama questa
+    funzione deve prevedere un fallback, es. il prezzo dai dati storici).
+    """
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception as e:
+        print(f"[ATTENZIONE] Impossibile recuperare la quotazione istantanea di {ticker}: {e}")
+        return None
+
+    if not info:
+        return None
+
+    market_state = info.get("marketState", "")
+
+    if market_state == "PRE" and info.get("preMarketPrice") is not None:
+        return float(info["preMarketPrice"])
+    if market_state in ("POST", "POSTPOST") and info.get("postMarketPrice") is not None:
+        return float(info["postMarketPrice"])
+    if info.get("regularMarketPrice") is not None:
+        return float(info["regularMarketPrice"])
+
+    return None
+
+
 def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
     """Scarica dati intraday e giornalieri e calcola i segnali quantitativi.
 
@@ -154,6 +189,7 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
         "bearish_signals": [],
         "factors": [],  # elenco strutturato {code, direction} per analisi future per-fattore
         "last_price": None,
+        "today_open": None,
     }
 
     try:
@@ -184,6 +220,7 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
 
         # --- Fattore 2: variazione prezzo giornaliera ---
         today_open = float(daily["Open"].iloc[-1])
+        result["today_open"] = today_open
         change_1d_pct = (last_price - today_open) / today_open * 100
         if abs(change_1d_pct) >= cfg["thresholds"]["price_change_1d_pct"]:
             result["score"] += 1
@@ -467,10 +504,20 @@ def find_todays_entry(ticker: str, entries: list, now: datetime):
     return None
 
 
-def build_update_message(ticker: str, quant: dict, news: dict, source: str, original_entry: dict) -> str:
-    """Messaggio "leggero" per un titolo già segnalato oggi: mostra la
-    fluttuazione rispetto al primo segnale, SENZA generare una nuova
-    previsione da tracciare (quella originale resta quella valida)."""
+def format_open_variation_line(display_price: float, today_open):
+    """Riga 'Variazione da apertura', calcolata sul prezzo istantaneo
+    (non su quello potenzialmente non aggiornato dei dati storici)."""
+    if today_open is None or not today_open:
+        return None
+    delta_open_pct = (display_price - today_open) / today_open * 100
+    return f"Variazione da apertura: {delta_open_pct:+.2f}%"
+
+
+def build_update_message(ticker: str, quant: dict, news: dict, source: str, original_entry: dict, display_price) -> str:
+    """Messaggio "leggero" per un titolo già segnalato oggi: mostra il
+    prezzo istantaneo e DUE variazioni distinte (da apertura e dall'ultimo
+    rilevamento), SENZA generare una nuova previsione da tracciare (quella
+    originale resta quella valida)."""
     label = "📌 Watchlist" if source == "watchlist" else "🔍 Scouting"
     lines = [f"<b>🔄 Aggiornamento su {ticker}</b> ({label})"]
 
@@ -483,12 +530,20 @@ def build_update_message(ticker: str, quant: dict, news: dict, source: str, orig
     if original_price is not None:
         lines.append(f"Primo segnale oggi: {orario_primo_segnale} (prezzo {original_price})")
 
-    current_price = quant.get("last_price")
-    if current_price is not None and original_price:
-        delta_pct = (current_price - original_price) / original_price * 100
-        lines.append(f"Prezzo attuale: {current_price} ({delta_pct:+.2f}% dal primo segnale)")
-    elif current_price is not None:
-        lines.append(f"Prezzo attuale: {current_price}")
+    if display_price is not None:
+        lines.append(f"Prezzo attuale (istantaneo): {display_price}")
+
+        # Variazione 1: rispetto all'apertura odierna
+        open_line = format_open_variation_line(display_price, quant.get("today_open"))
+        if open_line:
+            lines.append(open_line)
+
+        # Variazione 2: rispetto all'ultimo rilevamento (ultima "ronda" di
+        # analisi su questo titolo, non il primissimo segnale della giornata)
+        reference_price = original_entry.get("last_update_price") or original_price
+        if reference_price:
+            delta_last_pct = (display_price - reference_price) / reference_price * 100
+            lines.append(f"Variazione dall'ultimo rilevamento: {delta_last_pct:+.2f}%")
 
     lines.append(f"Punteggio checklist: {quant['score'] + news['score']}")
     lines.append("")
@@ -504,12 +559,17 @@ def build_update_message(ticker: str, quant: dict, news: dict, source: str, orig
     return "\n".join(lines)
 
 
-def build_alert_message(ticker: str, quant: dict, news: dict, source: str) -> str:
+def build_alert_message(ticker: str, quant: dict, news: dict, source: str, display_price) -> str:
     total_score = quant["score"] + news["score"]
     label = "📌 Watchlist" if source == "watchlist" else "🔍 Scouting"
     lines = [f"<b>⚠️ Segnale su {ticker}</b> ({label})"]
-    if quant.get("last_price") is not None:
-        lines.append(f"Prezzo attuale: {quant['last_price']}")
+
+    if display_price is not None:
+        lines.append(f"Prezzo attuale (istantaneo): {display_price}")
+        open_line = format_open_variation_line(display_price, quant.get("today_open"))
+        if open_line:
+            lines.append(open_line)
+
     lines.append(f"Punteggio checklist: {total_score}")
     lines.append("")
     for r in quant["reasons"] + news["reasons"]:
@@ -638,12 +698,22 @@ def main():
 
         if total_score >= threshold:
             any_alert = True
+
+            # Prezzo istantaneo (endpoint di quotazione, gestisce pre/after-market):
+            # usato per la VISUALIZZAZIONE e per il tracciamento del prezzo di
+            # riferimento. Se non disponibile, ripieghiamo sul prezzo dei dati
+            # storici già calcolato dentro quant (meglio di niente).
+            instant_price = get_instant_quote(ticker)
+            display_price = instant_price if instant_price is not None else quant.get("last_price")
+            if instant_price is None:
+                print(f"[ATTENZIONE] Quotazione istantanea non disponibile per {ticker}, uso il prezzo dei dati storici come riserva.")
+
             existing_entry = find_todays_entry(ticker, all_entries, now)
 
             if existing_entry is None:
                 # Primo segnale di oggi su questo titolo: previsione nuova da tracciare.
                 bias = compute_bias(quant)
-                message = build_alert_message(ticker, quant, news, source)
+                message = build_alert_message(ticker, quant, news, source, display_price)
                 send_telegram_message(message)
 
                 all_entries.append({
@@ -653,7 +723,7 @@ def main():
                     "bias": bias,
                     "score": total_score,
                     "factors": quant["factors"] + news["factors"],
-                    "price_at_alert": quant.get("last_price"),
+                    "price_at_alert": display_price,
                     "resolved": False,
                     "resolved_at": None,
                     "price_at_resolution": None,
@@ -667,12 +737,12 @@ def main():
             else:
                 # Titolo già segnalato oggi: aggiornamento informativo, la
                 # previsione originale (bias/prezzo/esito) NON viene toccata.
-                message = build_update_message(ticker, quant, news, source, existing_entry)
+                message = build_update_message(ticker, quant, news, source, existing_entry, display_price)
                 send_telegram_message(message)
 
                 existing_entry["update_count"] = existing_entry.get("update_count", 0) + 1
                 existing_entry["last_update_at"] = now.isoformat()
-                existing_entry["last_update_price"] = quant.get("last_price")
+                existing_entry["last_update_price"] = display_price
                 log_changed = True
                 print(f"[INFO] Aggiornamento (n. {existing_entry['update_count']}) per {ticker}, previsione originale invariata.")
         else:
