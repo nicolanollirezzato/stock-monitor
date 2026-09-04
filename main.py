@@ -3,10 +3,15 @@
 Strumento di monitoraggio azioni con checklist di valutazione.
 
 Ogni esecuzione (pensata per girare ogni 5 minuti via GitHub Actions):
-  1. Scarica dati di prezzo/volume per i ticker configurati (yfinance)
-  2. Calcola una checklist di segnali: variazione prezzo, volume anomalo,
+  1. Risolve le previsioni passate che hanno raggiunto l'orizzonte configurato
+     (confronta la direzione prevista con il prezzo attuale, per l'autovalutazione)
+  2. Scarica dati di prezzo/volume per i ticker configurati (yfinance)
+  3. Calcola una checklist di segnali: variazione prezzo, volume anomalo,
      incrocio medie mobili, notizie rilevanti recenti (RSS)
-  3. Se il punteggio totale supera la soglia, invia un messaggio Telegram
+  4. Analizza separatamente le notizie sulle materie prime (petrolio, gas, metalli)
+  5. Se il punteggio totale supera la soglia, invia un messaggio Telegram con
+     un commento ragionato sulla direzione, e registra la previsione per
+     poterla verificare in futuro (report.py)
 
 NOTA IMPORTANTE: questo strumento genera segnali puramente informativi
 basati su regole semplici. NON è consulenza finanziaria e non garantisce
@@ -14,16 +19,18 @@ nulla sui movimenti di mercato. Le decisioni di acquisto/vendita restano
 sempre e solo tue.
 """
 
-import os
-import sys
-import yaml
-import requests
 import feedparser
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
+from common import (
+    load_config,
+    trading_day_fraction_elapsed,
+    send_telegram_message,
+    load_log,
+    save_log,
+)
 
 # Lista di riserva se il download da Wikipedia dei componenti S&P 500 fallisse
 # (sottoinsieme di grandi titoli USA, aggiornabile a mano quando serve)
@@ -36,18 +43,12 @@ SP500_FALLBACK = [
 ]
 
 
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
 def get_sp500_universe() -> list:
     """Recupera l'elenco dei ticker S&P 500 da Wikipedia; usa una lista di
     riserva statica se il download fallisce (rete assente, pagina cambiata, ecc.)."""
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         symbols = tables[0]["Symbol"].tolist()
-        # Yahoo Finance usa "-" al posto di "." per alcuni ticker (es. BRK.B -> BRK-B)
         symbols = [s.replace(".", "-") for s in symbols]
         if len(symbols) > 50:
             return symbols
@@ -60,7 +61,7 @@ def get_sp500_universe() -> list:
 
 def scout_top_movers(cfg: dict) -> list:
     """Scarica dati giornalieri in blocco per l'universo configurato e
-    individua i titoli con variazione % o volume più anomali (top mover)."""
+    individua i titoli con variazione %, volume o range intraday più anomali."""
     scouting_cfg = cfg.get("scouting", {})
     if not scouting_cfg.get("enabled"):
         return []
@@ -74,8 +75,6 @@ def scout_top_movers(cfg: dict) -> list:
     print(f"[INFO] Scouting su {len(universe)} titoli dell'universo {universe_name}...")
 
     try:
-        # Un'unica chiamata "bulk" per tutti i titoli: molto più leggera di
-        # 500 chiamate singole e riduce il rischio di rate-limit.
         data = yf.download(
             tickers=universe,
             period="25d",
@@ -87,6 +86,8 @@ def scout_top_movers(cfg: dict) -> list:
     except Exception as e:
         print(f"[ERRORE] Download bulk per lo scouting fallito: {e}")
         return []
+
+    day_fraction = trading_day_fraction_elapsed()
 
     candidates = []
     for ticker in universe:
@@ -100,63 +101,63 @@ def scout_top_movers(cfg: dict) -> list:
             prev_close = float(df["Close"].iloc[-2])
             change_pct = (last_close - prev_close) / prev_close * 100
 
-            avg_volume = df["Volume"].iloc[:-1].mean()
-            last_volume = float(df["Volume"].iloc[-1])
-            volume_ratio = last_volume / avg_volume if avg_volume > 0 else 0
+            today_open = float(df["Open"].iloc[-1])
+            today_high = float(df["High"].iloc[-1])
+            today_low = float(df["Low"].iloc[-1])
+            intraday_range_pct = (today_high - today_low) / today_open * 100 if today_open > 0 else 0
+
+            avg_full_day_volume = df["Volume"].iloc[:-1].mean()
+            today_volume_so_far = float(df["Volume"].iloc[-1])
+            expected_volume_by_now = avg_full_day_volume * day_fraction
+            volume_ratio = (
+                today_volume_so_far / expected_volume_by_now if expected_volume_by_now > 0 else 0
+            )
 
             passes_change = abs(change_pct) >= scouting_cfg.get("min_abs_change_pct", 2.0)
             passes_volume = volume_ratio >= scouting_cfg.get("min_volume_ratio", 1.5)
+            passes_range = intraday_range_pct >= scouting_cfg.get("min_intraday_range_pct", 3.0)
 
-            if passes_change or passes_volume:
-                # Punteggio di "interesse" grezzo per ordinare i candidati
-                interest_score = abs(change_pct) + volume_ratio
-                candidates.append((ticker, interest_score, change_pct, volume_ratio))
+            if passes_change or passes_volume or passes_range:
+                interest_score = abs(change_pct) + volume_ratio + intraday_range_pct
+                candidates.append((ticker, interest_score, change_pct, volume_ratio, intraday_range_pct))
         except Exception:
-            continue  # ticker con dati mancanti/incompleti: si salta senza bloccare tutto
+            continue
 
     candidates.sort(key=lambda x: x[1], reverse=True)
     top_n = scouting_cfg.get("top_n", 10)
     top_tickers = [c[0] for c in candidates[:top_n]]
 
-    for t, score, chg, vol in candidates[:top_n]:
-        print(f"  [SCOUT] {t}: var {chg:+.2f}%, volume {vol:.1f}x media -> interesse {score:.2f}")
+    for t, score, chg, vol, rng in candidates[:top_n]:
+        print(
+            f"  [SCOUT] {t}: var {chg:+.2f}%, volume {vol:.1f}x atteso, "
+            f"range oggi {rng:.1f}% -> interesse {score:.2f}"
+        )
 
     return top_tickers
 
 
-def send_telegram_message(text: str):
-    """Invia un messaggio al bot Telegram configurato tramite variabili d'ambiente."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("[ATTENZIONE] TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID mancanti: alert non inviato.")
-        print(text)
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    try:
-        resp = requests.post(url, data=payload, timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[ERRORE] Invio Telegram fallito: {e}")
-
-
 def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
-    """Scarica dati intraday e giornalieri e calcola i segnali quantitativi."""
+    """Scarica dati intraday e giornalieri e calcola i segnali quantitativi.
+
+    Oltre a "reasons" (elenco testuale per l'alert), popola anche
+    "bullish_signals" e "bearish_signals": servono al commento ragionato per
+    capire se i fattori attivati puntano più verso un rialzo o un ribasso.
+    Il volume anomalo non viene conteggiato come direzionale (può
+    accompagnare sia un rialzo che un ribasso), resta solo in "reasons".
+    """
     result = {
         "ticker": ticker,
         "score": 0,
         "reasons": [],
+        "bullish_signals": [],
+        "bearish_signals": [],
         "last_price": None,
     }
 
     try:
         tk = yf.Ticker(ticker)
 
-        # Dati intraday (ultimi 2 giorni, intervallo 5 minuti) per variazione a breve termine
         intraday = tk.history(period="2d", interval="5m")
-        # Dati giornalieri (ultimi ~60 giorni) per medie mobili e volume medio
         daily = tk.history(period="60d", interval="1d")
 
         if intraday.empty or daily.empty:
@@ -173,9 +174,9 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
             if abs(change_5m_pct) >= cfg["thresholds"]["price_change_5m_pct"]:
                 result["score"] += 1
                 direzione = "rialzo" if change_5m_pct > 0 else "ribasso"
-                result["reasons"].append(
-                    f"Movimento rapido: {change_5m_pct:+.2f}% negli ultimi 5 min ({direzione})."
-                )
+                detail = f"Movimento rapido: {change_5m_pct:+.2f}% negli ultimi 5 min ({direzione})."
+                result["reasons"].append(detail)
+                (result["bullish_signals"] if change_5m_pct > 0 else result["bearish_signals"]).append(detail)
 
         # --- Fattore 2: variazione prezzo giornaliera ---
         today_open = float(daily["Open"].iloc[-1])
@@ -183,19 +184,20 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
         if abs(change_1d_pct) >= cfg["thresholds"]["price_change_1d_pct"]:
             result["score"] += 1
             direzione = "rialzo" if change_1d_pct > 0 else "ribasso"
-            result["reasons"].append(
-                f"Variazione giornaliera: {change_1d_pct:+.2f}% ({direzione})."
-            )
+            detail = f"Variazione giornaliera: {change_1d_pct:+.2f}% ({direzione})."
+            result["reasons"].append(detail)
+            (result["bullish_signals"] if change_1d_pct > 0 else result["bearish_signals"]).append(detail)
 
-        # --- Fattore 3: volume anomalo ---
+        # --- Fattore 3: volume anomalo (corretto per l'orario di borsa) ---
         avg_volume = daily["Volume"].iloc[:-1].mean()
         today_volume = daily["Volume"].iloc[-1]
-        if avg_volume > 0:
-            volume_ratio = today_volume / avg_volume
+        expected_volume_by_now = avg_volume * trading_day_fraction_elapsed()
+        if expected_volume_by_now > 0:
+            volume_ratio = today_volume / expected_volume_by_now
             if volume_ratio >= cfg["thresholds"]["volume_spike_ratio"]:
                 result["score"] += 1
                 result["reasons"].append(
-                    f"Volume anomalo: {volume_ratio:.1f}x rispetto alla media storica."
+                    f"Volume anomalo: {volume_ratio:.1f}x rispetto all'atteso per quest'ora."
                 )
 
         # --- Fattore 4: incrocio medie mobili (SMA breve vs lunga) ---
@@ -213,14 +215,14 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
 
             if crossed_up:
                 result["score"] += 1
-                result["reasons"].append(
-                    f"Incrocio rialzista: media mobile {short_p}gg ha superato quella a {long_p}gg."
-                )
+                detail = f"Incrocio rialzista: media mobile {short_p}gg ha superato quella a {long_p}gg."
+                result["reasons"].append(detail)
+                result["bullish_signals"].append(detail)
             elif crossed_down:
                 result["score"] += 1
-                result["reasons"].append(
-                    f"Incrocio ribassista: media mobile {short_p}gg è scesa sotto quella a {long_p}gg."
-                )
+                detail = f"Incrocio ribassista: media mobile {short_p}gg è scesa sotto quella a {long_p}gg."
+                result["reasons"].append(detail)
+                result["bearish_signals"].append(detail)
 
     except Exception as e:
         result["reasons"].append(f"Errore durante l'analisi quantitativa: {e}")
@@ -229,14 +231,13 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
 
 
 def check_relevant_news(ticker: str, cfg: dict) -> dict:
-    """Controlla i feed RSS configurati per notizie recenti con parole chiave rilevanti."""
+    """Controlla i feed RSS configurati per notizie recenti con parole chiave rilevanti
+    per il singolo titolo."""
     result = {"score": 0, "reasons": [], "matched_titles": []}
 
     lookback = timedelta(hours=cfg["thresholds"]["news_lookback_hours"])
     now = datetime.now(timezone.utc)
     keywords = [k.lower() for k in cfg["news_keywords"]]
-
-    # Nome "semplice" del titolo per il matching testuale (rimuove suffissi tipo .MI)
     ticker_name = ticker.split(".")[0].lower()
 
     matches = []
@@ -251,7 +252,6 @@ def check_relevant_news(ticker: str, cfg: dict) -> dict:
             title = getattr(entry, "title", "") or ""
             title_lower = title.lower()
 
-            # Filtro temporale, se il feed fornisce la data di pubblicazione
             published = getattr(entry, "published_parsed", None)
             if published:
                 pub_dt = datetime(*published[:6], tzinfo=timezone.utc)
@@ -270,9 +270,167 @@ def check_relevant_news(ticker: str, cfg: dict) -> dict:
             f"Trovate {len(matches)} notizie potenzialmente rilevanti nelle ultime "
             f"{cfg['thresholds']['news_lookback_hours']} ore."
         )
-        result["matched_titles"] = matches[:5]  # limitiamo per non allungare troppo il messaggio
+        result["matched_titles"] = matches[:5]
 
     return result
+
+
+def check_commodity_news(cfg: dict) -> dict:
+    """Analisi specializzata sulle notizie relative alle materie prime
+    (petrolio, gas, metalli preziosi/industriali, ...), indipendente dai
+    singoli titoli della watchlist/scouting.
+
+    NOTA: come per le notizie sui titoli, il matching è per parole chiave,
+    NON per sentiment: una notizia può menzionare "petrolio" in un contesto
+    sia positivo che negativo per i prezzi.
+    """
+    commodities_cfg = cfg.get("commodities", {})
+    if not commodities_cfg.get("enabled"):
+        return {"triggered": {}}
+
+    lookback = timedelta(hours=commodities_cfg.get("lookback_hours", 6))
+    now = datetime.now(timezone.utc)
+    min_count = commodities_cfg.get("min_count_for_alert", 2)
+
+    # Raccogliamo una sola volta tutte le entry recenti da tutti i feed,
+    # poi le confrontiamo con le parole chiave di ciascuna categoria.
+    recent_entries = []
+    for feed_info in commodities_cfg.get("feeds", []):
+        try:
+            feed = feedparser.parse(feed_info["url"])
+        except Exception as e:
+            print(f"[ATTENZIONE] Impossibile leggere il feed materie prime {feed_info['name']}: {e}")
+            continue
+
+        for entry in feed.entries:
+            title = getattr(entry, "title", "") or ""
+            published = getattr(entry, "published_parsed", None)
+            if published:
+                pub_dt = datetime(*published[:6], tzinfo=timezone.utc)
+                if now - pub_dt > lookback:
+                    continue
+            recent_entries.append((feed_info["name"], title))
+
+    triggered = {}
+    for category, cat_cfg in commodities_cfg.get("categories", {}).items():
+        keywords = [k.lower() for k in cat_cfg.get("keywords", [])]
+        matches = [
+            f"[{feed_name}] {title}"
+            for feed_name, title in recent_entries
+            if any(k in title.lower() for k in keywords)
+        ]
+        if len(matches) >= min_count:
+            triggered[category] = matches[:5]
+
+    return {"triggered": triggered}
+
+
+COMMODITY_LABELS = {
+    "petrolio": "🛢️ Petrolio",
+    "gas_naturale": "🔥 Gas naturale",
+    "metalli_preziosi": "🥇 Metalli preziosi",
+    "metalli_industriali": "⚙️ Metalli industriali",
+}
+
+
+def build_commodity_alert_message(triggered: dict) -> str:
+    lines = ["<b>🌍 Materie Prime — notizie rilevanti</b>", ""]
+    for category, matches in triggered.items():
+        label = COMMODITY_LABELS.get(category, category.replace("_", " ").capitalize())
+        lines.append(f"<b>{label}</b>")
+        for m in matches:
+            lines.append(f"  • {m}")
+        lines.append("")
+    lines.append(
+        "⚠️ Match per parole chiave, non per sentiment: leggi i titoli prima "
+        "di interpretarli come positivi o negativi per i prezzi."
+    )
+    return "\n".join(lines)
+
+
+def compute_bias(quant: dict) -> str:
+    """Determina una direzione di massima (rialzista/ribassista/incerta) in
+    base a quanti fattori attivati puntano in una direzione o nell'altra."""
+    n_bull = len(quant.get("bullish_signals", []))
+    n_bear = len(quant.get("bearish_signals", []))
+    if n_bull > n_bear:
+        return "rialzista"
+    if n_bear > n_bull:
+        return "ribassista"
+    return "incerta"
+
+
+def generate_action_commentary(quant: dict, news: dict) -> list:
+    """Genera un commento ragionato sulla base dei fattori attivati.
+
+    IMPORTANTE PER CHI MODIFICA QUESTO CODICE: questa funzione produce
+    un'INTERPRETAZIONE dei segnali tecnici (rialzista/ribassista/incerta) con
+    considerazioni di processo generiche, NON un ordine di trading. Non
+    include mai importi, quantità di azioni o livelli di prezzo precisi da
+    eseguire: lo strumento non conosce il capitale, l'orizzonte temporale o
+    la tolleranza al rischio della persona, quindi non può calcolarli in
+    modo responsabile. Chi usa lo strumento decide sempre in autonomia.
+    """
+    bullish = quant.get("bullish_signals", [])
+    bearish = quant.get("bearish_signals", [])
+    bias = compute_bias(quant)
+
+    lines = ["", "<b>💡 Lettura dei segnali</b>"]
+
+    if bias == "rialzista":
+        lines.append("Direzione prevalente: <b>rialzista</b>.")
+        lines.append("Fattori a supporto:")
+        lines += [f"  • {r}" for r in bullish]
+        if bearish:
+            lines.append("In controtendenza:")
+            lines += [f"  • {r}" for r in bearish]
+        lines.append(
+            "Se stessi valutando un ACQUISTO, di solito si ragiona su: livello "
+            "di ingresso rispetto ai prezzi recenti (non necessariamente subito "
+            "'a mercato'), dimensionamento della posizione in proporzione al "
+            "tuo capitale e alla tua tolleranza al rischio, ed eventuale "
+            "stop-loss impostato in anticipo sotto un supporto tecnico recente."
+        )
+    elif bias == "ribassista":
+        lines.append("Direzione prevalente: <b>ribassista</b>.")
+        lines.append("Fattori a supporto:")
+        lines += [f"  • {r}" for r in bearish]
+        if bullish:
+            lines.append("In controtendenza:")
+            lines += [f"  • {r}" for r in bullish]
+        lines.append(
+            "Se possiedi il titolo e stessi valutando una VENDITA (totale o "
+            "parziale), di solito si ragiona su: se il calo sembra strutturale "
+            "o transitorio, se alleggerire solo una parte della posizione, ed "
+            "eventualmente un trailing stop per proteggere i guadagni già "
+            "maturati. Se invece stavi valutando un acquisto, questi segnali "
+            "suggeriscono cautela nell'ingresso ora."
+        )
+    else:
+        lines.append("Direzione: <b>segnali contrastanti o poco chiari</b>.")
+        lines.append(
+            "I fattori attivati non danno una lettura univoca (es. volume "
+            "anomalo senza una chiara direzione di prezzo, o segnali "
+            "rialzisti e ribassisti in pari numero). In casi così, spesso "
+            "conviene attendere ulteriori conferme prima di agire."
+        )
+
+    if news.get("matched_titles"):
+        lines.append(
+            "⚠️ Le notizie sono individuate per parole chiave, NON per "
+            "sentiment: leggi i titoli prima di interpretarli come positivi "
+            "o negativi (es. 'acquisizione' può riferirsi a un'acquisizione "
+            "saltata, non conclusa)."
+        )
+
+    lines.append(
+        "🚫 Non è un consiglio di investimento: è un'interpretazione "
+        "automatica di regole tecniche semplici, che non conosce il tuo "
+        "portafoglio né la tua tolleranza al rischio. Verifica sempre in "
+        "autonomia o consulta un consulente finanziario abilitato."
+    )
+
+    return lines
 
 
 def build_alert_message(ticker: str, quant: dict, news: dict, source: str) -> str:
@@ -290,24 +448,110 @@ def build_alert_message(ticker: str, quant: dict, news: dict, source: str) -> st
         lines.append("Notizie correlate:")
         for t in news["matched_titles"]:
             lines.append(f"  - {t}")
-    lines.append("")
-    lines.append("ℹ️ Segnale informativo generato da regole automatiche, NON è consulenza finanziaria.")
+
+    lines += generate_action_commentary(quant, news)
+
     return "\n".join(lines)
+
+
+def resolve_pending_predictions(cfg: dict):
+    """Controlla le previsioni registrate in passato che hanno raggiunto
+    l'orizzonte temporale configurato (default 24h) e le segna come
+    corrette/errate confrontando la direzione prevista con il prezzo attuale.
+
+    "Corretto" = il prezzo si è mosso nella direzione indicata (su per un
+    segnale rialzista, giù per uno ribassista) entro l'orizzonte, a
+    prescindere dall'entità del movimento. I segnali con bias "incerta" non
+    vengono classificati come corretti/errati (non c'era una previsione
+    direzionale da verificare).
+    """
+    entries = load_log()
+    if not entries:
+        return
+
+    horizon_hours = cfg.get("tracking", {}).get("horizon_hours", 24)
+    horizon = timedelta(hours=horizon_hours)
+    now = datetime.now(timezone.utc)
+
+    due = []
+    for e in entries:
+        if e.get("resolved"):
+            continue
+        try:
+            alert_time = datetime.fromisoformat(e["timestamp"])
+        except Exception:
+            continue
+        if now - alert_time >= horizon:
+            due.append(e)
+
+    if not due:
+        return
+
+    tickers_needed = sorted(set(e["ticker"] for e in due))
+    print(f"[INFO] Risolvo {len(due)} previsioni in sospeso su {len(tickers_needed)} titoli...")
+
+    try:
+        data = yf.download(
+            tickers=tickers_needed,
+            period="5d",
+            interval="1d",
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
+    except Exception as e:
+        print(f"[ATTENZIONE] Impossibile scaricare i prezzi per la risoluzione: {e}")
+        return
+
+    current_prices = {}
+    for t in tickers_needed:
+        try:
+            df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+            df = df.dropna()
+            if not df.empty:
+                current_prices[t] = float(df["Close"].iloc[-1])
+        except Exception:
+            continue
+
+    resolved_count = 0
+    for e in due:
+        price_now = current_prices.get(e["ticker"])
+        if price_now is None:
+            continue  # dati non disponibili ora: si riproverà al prossimo ciclo
+
+        e["resolved"] = True
+        e["resolved_at"] = now.isoformat()
+        e["price_at_resolution"] = round(price_now, 2)
+
+        if e.get("bias") == "incerta" or e.get("price_at_alert") is None:
+            e["outcome"] = "non_classificabile"
+        else:
+            went_up = price_now > e["price_at_alert"]
+            predicted_up = (e["bias"] == "rialzista")
+            e["outcome"] = "corretto" if went_up == predicted_up else "errato"
+        resolved_count += 1
+
+    if resolved_count:
+        save_log(entries)
+        print(f"[INFO] {resolved_count} previsioni risolte e salvate nello storico.")
 
 
 def main():
     cfg = load_config()
     threshold = cfg["thresholds"]["alert_score_threshold"]
 
+    # Prima di generare nuovi segnali, risolviamo le previsioni passate che
+    # hanno raggiunto l'orizzonte configurato (serve al report di autovalutazione).
+    resolve_pending_predictions(cfg)
+
     watchlist = list(cfg.get("tickers", []))
     scouted = scout_top_movers(cfg)
-
-    # Evita di analizzare due volte un titolo se è sia in watchlist sia scovato ora
     scouted_unique = [t for t in scouted if t not in watchlist]
-
     all_targets = [(t, "watchlist") for t in watchlist] + [(t, "scouting") for t in scouted_unique]
 
     any_alert = False
+    new_log_entries = []
+
     for ticker, source in all_targets:
         print(f"--- Analisi {ticker} ({source}) ---")
         quant = analyze_price_and_volume(ticker, cfg)
@@ -317,10 +561,37 @@ def main():
 
         if total_score >= threshold:
             any_alert = True
+            bias = compute_bias(quant)
             message = build_alert_message(ticker, quant, news, source)
             send_telegram_message(message)
+
+            new_log_entries.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "ticker": ticker,
+                "source": source,
+                "bias": bias,
+                "score": total_score,
+                "price_at_alert": quant.get("last_price"),
+                "resolved": False,
+                "resolved_at": None,
+                "price_at_resolution": None,
+                "outcome": None,
+            })
         else:
             print("Nessun segnale rilevante al momento.")
+
+    # Analisi specializzata sulle materie prime (indipendente dai singoli titoli)
+    commodity_result = check_commodity_news(cfg)
+    if commodity_result["triggered"]:
+        any_alert = True
+        send_telegram_message(build_commodity_alert_message(commodity_result["triggered"]))
+        print(f"[INFO] Alert materie prime inviato: {list(commodity_result['triggered'].keys())}")
+
+    # Registriamo le nuove previsioni nello storico (una sola lettura/scrittura per ciclo)
+    if new_log_entries:
+        existing = load_log()
+        save_log(existing + new_log_entries)
+        print(f"[INFO] {len(new_log_entries)} nuove previsioni registrate nello storico.")
 
     if not any_alert:
         print("Ciclo completato: nessun alert da inviare.")

@@ -1,0 +1,30 @@
+name: Report Autovalutazione
+
+on:
+  schedule:
+    # Una volta al giorno, alle 21:00 UTC (~dopo la chiusura di Wall Street,
+    # con qualche margine per via dell'ora legale USA). Orario approssimativo:
+    # modifica pure se preferisci un altro momento della giornata.
+    - cron: "0 21 * * *"
+  workflow_dispatch: {}  # permette anche l'avvio manuale dalla tab "Actions"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installa dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Genera e invia il report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python report.py

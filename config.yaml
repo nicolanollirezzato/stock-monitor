@@ -26,7 +26,13 @@ scouting:
   min_abs_change_pct: 2.0
 
   # Rapporto volume attuale / media che rende un titolo interessante per lo scouting
+  # (corretto in base a quanto è avanzata la giornata di borsa)
   min_volume_ratio: 1.5
+
+  # Range intraday di oggi (high-low rispetto all'apertura) che segnala
+  # volatilità intraday anche se il prezzo attuale è tornato vicino a ieri
+  # (cattura i casi "balzo e rientro" che il solo cambio % giornaliero perde)
+  min_intraday_range_pct: 3.0
 
 # Soglie della checklist di valutazione
 thresholds:
@@ -69,7 +75,76 @@ news_keywords:
   - lawsuit
   - causa legale
 
-# Feed RSS dei principali siti finanziari da controllare per le news
+# =========================================================
+# AUTOVALUTAZIONE (tracking delle previsioni per il report)
+# =========================================================
+tracking:
+  # Dopo quante ore da un alert si controlla se la direzione prevista
+  # (rialzista/ribassista) si è rivelata corretta, confrontando il prezzo.
+  horizon_hours: 24
+
+# =========================================================
+# MATERIE PRIME (analisi separata dai singoli titoli)
+# =========================================================
+commodities:
+  enabled: true
+
+  # Quante ore indietro guardare per le notizie sulle materie prime
+  lookback_hours: 6
+
+  # Numero minimo di notizie pertinenti per far scattare l'alert su una categoria
+  min_count_for_alert: 2
+
+  categories:
+    petrolio:
+      keywords:
+        - crude oil
+        - wti
+        - brent
+        - opec
+        - opec+
+        - petrolio
+        - greggio
+    gas_naturale:
+      keywords:
+        - natural gas
+        - gas naturale
+        - lng
+        - henry hub
+        - gasdotto
+    metalli_preziosi:
+      keywords:
+        - gold
+        - oro
+        - silver
+        - argento
+        - bullion
+        - platinum
+        - platino
+    metalli_industriali:
+      keywords:
+        - copper
+        - rame
+        - aluminum
+        - alluminio
+        - lithium
+        - litio
+        - nickel
+        - nichel
+        - miniera
+        - mining
+
+  # Feed RSS specializzati in materie prime. NOTA: verifica ogni tanto che
+  # questi indirizzi siano ancora validi, i siti a volte cambiano struttura.
+  feeds:
+    - name: "OilPrice.com"
+      url: "https://oilprice.com/rss/main"
+    - name: "Mining.com"
+      url: "https://www.mining.com/feed/"
+    - name: "Reuters Commodities"
+      url: "https://feeds.reuters.com/reuters/commoditiesNews"
+
+# Feed RSS dei principali siti finanziari da controllare per le news sui singoli titoli
 rss_feeds:
   - name: "Reuters Business"
     url: "https://feeds.reuters.com/reuters/businessNews"
