@@ -513,6 +513,22 @@ def find_todays_entry(ticker: str, entries: list, now: datetime):
     return None
 
 
+def get_active_today_tickers(entries: list, now: datetime, exclude: set) -> set:
+    """Ritorna i ticker con una previsione di OGGI ancora non risolta, per
+    continuare ad analizzarli anche se non rientrano più tra i "top mover"
+    dello scouting in questo specifico ciclo. Senza questo, un titolo
+    scovato stamattina smetterebbe di essere controllato non appena altri
+    titoli si muovono di più, anche se ha ancora una previsione aperta oggi."""
+    tickers = set()
+    for e in entries:
+        ticker = e.get("ticker")
+        if not ticker or ticker in exclude or e.get("resolved"):
+            continue
+        if is_same_ny_day(e.get("timestamp", ""), now):
+            tickers.add(ticker)
+    return tickers
+
+
 def format_open_variation_line(display_price: float, today_open):
     """Riga 'Variazione da apertura', calcolata sul prezzo istantaneo
     (non su quello potenzialmente non aggiornato dei dati storici)."""
@@ -694,7 +710,20 @@ def main():
     watchlist = list(cfg.get("tickers", []))
     scouted = scout_top_movers(cfg)
     scouted_unique = [t for t in scouted if t not in watchlist]
-    all_targets = [(t, "watchlist") for t in watchlist] + [(t, "scouting") for t in scouted_unique]
+
+    # Titoli con una previsione ancora aperta OGGI (es. trovati dallo
+    # scouting in un ciclo precedente) che vanno ricontrollati anche se
+    # NON rientrano più tra i top mover di QUESTO specifico ciclio di scouting.
+    already_covered = set(watchlist) | set(scouted_unique)
+    carryover = sorted(get_active_today_tickers(all_entries, now, exclude=already_covered))
+    if carryover:
+        print(f"[INFO] Titoli con previsione aperta oggi non più in top-mover, ricontrollati comunque: {carryover}")
+
+    all_targets = (
+        [(t, "watchlist") for t in watchlist]
+        + [(t, "scouting") for t in scouted_unique]
+        + [(t, "scouting") for t in carryover]
+    )
 
     any_alert = False
 

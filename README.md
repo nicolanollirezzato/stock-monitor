@@ -218,6 +218,29 @@ riferimento per "Variazione da apertura" rifletta ancora quello di ieri
 anziché quello odierno. È un caso limite difficile da verificare senza
 osservare il comportamento durante una vera sessione di pre-market.
 
+### Un titolo scovato non "sparisce" più se esce dalla top-10
+
+**Problema risolto**: lo scouting rifà la scansione dell'intero S&P 500 ad
+ogni ciclo e prende solo i "top N" movimenti di quel momento specifico. Un
+titolo trovato al mattino poteva quindi uscire dalla top-10 in un ciclo
+successivo (perché altri titoli si muovevano di più in quel momento) e
+smettere di ricevere aggiornamenti, pur avendo ancora una previsione
+aperta in giornata da monitorare.
+
+**Correzione**: ad ogni ciclo, oltre alla watchlist fissa e ai top mover
+di *questo* scouting, vengono ricontrollati anche tutti i titoli con una
+previsione ancora aperta **oggi** (anche se non più tra i top mover del
+momento). Se il loro punteggio scende sotto soglia, semplicemente non
+arriva un nuovo messaggio quel ciclo (comportamento corretto) — ma non
+vengono più "persi" fino a fine giornata o fino alla risoluzione a 24 ore.
+
+**Nota sui costi**: nei giorni con molta attività di mercato, questo può
+far crescere il numero di titoli controllati ad ogni ciclo (uno in più per
+ogni nuovo titolo scovato durante la giornata, mantenuto fino a fine
+giornata), quindi qualche chiamata a Yahoo Finance in più con il passare
+delle ore. Per l'uso personale a cui è pensato lo strumento non dovrebbe
+essere un problema, ma è bene saperlo.
+
 ## 7. Attiva entrambi i workflow
 
 1. Vai nella tab **Actions** del repository.
