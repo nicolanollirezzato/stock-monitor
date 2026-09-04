@@ -5,12 +5,16 @@ Strumento di monitoraggio azioni con checklist di valutazione.
 Ogni esecuzione (pensata per girare ogni 5 minuti via GitHub Actions):
   1. Risolve le previsioni passate che hanno raggiunto l'orizzonte configurato
      (confronta la direzione prevista con il prezzo attuale, per l'autovalutazione)
-  2. Scarica dati di prezzo/volume per i ticker configurati (yfinance)
+  2. Scarica dati di prezzo/volume per i ticker configurati (yfinance). Lo
+     scouting sull'intero S&P 500 viene rifatto solo ogni N minuti (cache),
+     non ad ogni ciclo, per ridurre il carico su Yahoo Finance
   3. Calcola una checklist di segnali: variazione prezzo, volume anomalo,
-     incrocio medie mobili, notizie rilevanti recenti (RSS)
+     incrocio medie mobili, notizie rilevanti recenti (ora da Ticker.news,
+     già taggate da Yahoo per quel titolo specifico, non più RSS+keyword)
   4. Analizza separatamente le notizie sulle materie prime (petrolio, gas, metalli)
   5. Se il punteggio totale supera la soglia, invia un messaggio Telegram con
-     un commento ragionato sulla direzione, e registra la previsione per
+     un commento ragionato sulla direzione (e, sui nuovi segnali, un sentiment
+     opzionale da Alpha Vantage se configurato), e registra la previsione per
      poterla verificare in futuro (report.py)
 
 NOTA IMPORTANTE: questo strumento genera segnali puramente informativi
@@ -19,7 +23,9 @@ nulla sui movimenti di mercato. Le decisioni di acquisto/vendita restano
 sempre e solo tue.
 """
 
+import os
 import feedparser
+import requests
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -31,7 +37,27 @@ from common import (
     NY_TZ,
     load_log,
     save_log,
+    append_health_entry,
+    load_scouting_cache,
+    save_scouting_cache,
 )
+
+# Contatori del run corrente, usati per il log di salute operativa a fine
+# ciclo. Un dict a livello di modulo è una scelta pragmatica: lo script gira
+# come processo singolo e a se stante ad ogni esecuzione, quindi non serve
+# passare questo stato attraverso tutte le funzioni.
+RUN_STATS = {"errors": 0, "warnings": 0}
+
+
+def log_error(msg: str):
+    print(f"[ERRORE] {msg}")
+    RUN_STATS["errors"] += 1
+
+
+def log_warning(msg: str):
+    print(f"[ATTENZIONE] {msg}")
+    RUN_STATS["warnings"] += 1
+
 
 # Lista di riserva se il download da Wikipedia dei componenti S&P 500 fallisse
 # (sottoinsieme di grandi titoli USA, aggiornabile a mano quando serve)
@@ -54,7 +80,7 @@ def get_sp500_universe() -> list:
         if len(symbols) > 50:
             return symbols
     except Exception as e:
-        print(f"[ATTENZIONE] Impossibile scaricare la lista S&P 500 da Wikipedia: {e}")
+        log_warning(f"Impossibile scaricare la lista S&P 500 da Wikipedia: {e}")
 
     print("[INFO] Uso la lista di riserva statica per lo scouting.")
     return SP500_FALLBACK
@@ -69,7 +95,7 @@ def scout_top_movers(cfg: dict) -> list:
 
     universe_name = scouting_cfg.get("universe", "sp500")
     if universe_name != "sp500":
-        print(f"[ATTENZIONE] Universo di scouting '{universe_name}' non supportato, salto lo scouting.")
+        log_warning(f"Universo di scouting '{universe_name}' non supportato, salto lo scouting.")
         return []
 
     universe = get_sp500_universe()
@@ -89,7 +115,7 @@ def scout_top_movers(cfg: dict) -> list:
             progress=False,
         )
     except Exception as e:
-        print(f"[ERRORE] Download bulk per lo scouting fallito: {e}")
+        log_error(f"Download bulk per lo scouting fallito: {e}")
         return []
 
     day_fraction = trading_day_fraction_elapsed()
@@ -132,7 +158,7 @@ def scout_top_movers(cfg: dict) -> list:
             continue
 
     if falliti:
-        print(f"[ATTENZIONE] Dati mancanti/non validi per {len(falliti)} titoli su {len(universe)} nello scouting: {falliti[:15]}{'...' if len(falliti) > 15 else ''}")
+        log_warning(f"Dati mancanti/non validi per {len(falliti)} titoli su {len(universe)} nello scouting: {falliti[:15]}{'...' if len(falliti) > 15 else ''}")
 
     candidates.sort(key=lambda x: x[1], reverse=True)
     top_n = scouting_cfg.get("top_n", 10)
@@ -164,7 +190,7 @@ def get_instant_quote(ticker: str):
     try:
         info = yf.Ticker(ticker).info
     except Exception as e:
-        print(f"[ATTENZIONE] Impossibile recuperare la quotazione istantanea di {ticker}: {e}")
+        log_warning(f"Impossibile recuperare la quotazione istantanea di {ticker}: {e}")
         return None
 
     if not info:
@@ -290,56 +316,63 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
                 result["factors"].append({"code": "sma_cross", "direction": "bearish"})
 
     except Exception as e:
-        print(f"[ERRORE] Analisi quantitativa di {ticker} fallita: {e}")
+        log_error(f"Analisi quantitativa di {ticker} fallita: {e}")
         result["reasons"].append(f"Errore durante l'analisi quantitativa: {e}")
 
     return result
 
 
 def check_relevant_news(ticker: str, cfg: dict) -> dict:
-    """Controlla i feed RSS configurati per notizie recenti con parole chiave rilevanti
-    per il singolo titolo."""
+    """Controlla le notizie recenti su QUESTO titolo specifico.
+
+    Usa Ticker.news di yfinance: Yahoo ha già associato queste notizie al
+    titolo, quindi non serve più cercare parole chiave in feed generici
+    (che potevano dare sia falsi positivi che falsi negativi). Il
+    controllo per parole chiave resta disponibile come filtro opzionale se
+    configurato in news_keywords, ma di default qualunque notizia recente
+    associata al titolo viene considerata pertinente.
+    """
     result = {"score": 0, "reasons": [], "matched_titles": [], "factors": []}
 
     lookback = timedelta(hours=cfg["thresholds"]["news_lookback_hours"])
     now = datetime.now(timezone.utc)
-    keywords = [k.lower() for k in cfg["news_keywords"]]
-    ticker_name = ticker.split(".")[0].lower()
+    keywords = [k.lower() for k in cfg.get("news_keywords", [])]
+
+    try:
+        news_items = yf.Ticker(ticker).news or []
+    except Exception as e:
+        log_warning(f"Impossibile recuperare le notizie di {ticker}: {e}")
+        return result
 
     matches = []
-    for feed_info in cfg["rss_feeds"]:
-        try:
-            feed = feedparser.parse(feed_info["url"])
-        except Exception as e:
-            print(f"[ATTENZIONE] Impossibile leggere il feed {feed_info['name']}: {e}")
-            result["reasons"].append(f"Impossibile leggere il feed {feed_info['name']}: {e}")
-            continue
+    for item in news_items:
+        content = item.get("content", item)  # alcune versioni di yfinance non annidano in "content"
+        title = content.get("title", "") or ""
 
-        for entry in feed.entries:
-            title = getattr(entry, "title", "") or ""
-            title_lower = title.lower()
-
-            published = getattr(entry, "published_parsed", None)
-            if published:
-                pub_dt = datetime(*published[:6], tzinfo=timezone.utc)
+        pub_date_str = content.get("pubDate") or content.get("displayTime")
+        if pub_date_str:
+            try:
+                pub_dt = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
                 if now - pub_dt > lookback:
                     continue
+            except Exception:
+                pass  # data non interpretabile: non escludiamo la notizia solo per questo
 
-            keyword_hit = any(k in title_lower for k in keywords)
-            ticker_hit = ticker_name in title_lower
+        if keywords and not any(k in title.lower() for k in keywords):
+            continue  # filtro parole chiave opzionale, se configurato
 
-            if keyword_hit or ticker_hit:
-                matches.append(f"[{feed_info['name']}] {title}")
+        publisher = (content.get("provider") or {}).get("displayName", "Yahoo Finance")
+        matches.append(f"[{publisher}] {title}")
 
     if len(matches) >= cfg["thresholds"]["news_min_count"]:
         result["score"] += 1
         result["reasons"].append(
-            f"Trovate {len(matches)} notizie potenzialmente rilevanti nelle ultime "
+            f"Trovate {len(matches)} notizie recenti su {ticker} nelle ultime "
             f"{cfg['thresholds']['news_lookback_hours']} ore."
         )
         result["matched_titles"] = matches[:5]
-        # Direzione "neutral": il matching per parole chiave non permette di
-        # stabilire se la notizia sia positiva o negativa per il prezzo.
+        # Direzione "neutral": senza un vero punteggio di sentiment non
+        # possiamo stabilire se le notizie siano positive o negative.
         result["factors"].append({"code": "news", "direction": "neutral"})
 
     return result
@@ -369,7 +402,7 @@ def check_commodity_news(cfg: dict) -> dict:
         try:
             feed = feedparser.parse(feed_info["url"])
         except Exception as e:
-            print(f"[ATTENZIONE] Impossibile leggere il feed materie prime {feed_info['name']}: {e}")
+            log_warning(f"Impossibile leggere il feed materie prime {feed_info['name']}: {e}")
             continue
 
         for entry in feed.entries:
@@ -393,6 +426,52 @@ def check_commodity_news(cfg: dict) -> dict:
             triggered[category] = matches[:5]
 
     return {"triggered": triggered}
+
+
+def get_sentiment_score(ticker: str):
+    """Recupera un punteggio di sentiment (Alpha Vantage NEWS_SENTIMENT) per
+    questo titolo, se è configurata la chiave API gratuita.
+
+    Va chiamata SOLO sui nuovi segnali di giornata (non sugli aggiornamenti
+    dello stesso titolo), per restare comodamente entro il limite gratuito
+    di Alpha Vantage (25 richieste/giorno). Se la chiave manca, la richiesta
+    fallisce o il limite è stato raggiunto, restituisce None: il resto dello
+    strumento continua a funzionare normalmente, semplicemente senza questa
+    informazione aggiuntiva.
+    """
+    api_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        resp = requests.get(
+            "https://www.alphavantage.co/query",
+            params={"function": "NEWS_SENTIMENT", "tickers": ticker, "apikey": api_key, "limit": 10},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log_warning(f"Sentiment Alpha Vantage non disponibile per {ticker}: {e}")
+        return None
+
+    # Alpha Vantage segnala il limite giornaliero raggiunto (o una chiave non
+    # valida) con una risposta 200 OK contenente "Information" o "Note", non
+    # con un errore HTTP: va controllato esplicitamente nel corpo.
+    if "Information" in data or "Note" in data:
+        log_warning(f"Alpha Vantage non disponibile ({data.get('Information') or data.get('Note')}).")
+        return None
+
+    for article in data.get("feed", []):
+        for ts in article.get("ticker_sentiment", []):
+            if ts.get("ticker") == ticker:
+                try:
+                    score = float(ts.get("ticker_sentiment_score"))
+                except (TypeError, ValueError):
+                    continue
+                return {"score": score, "label": ts.get("ticker_sentiment_label", "")}
+
+    return None
 
 
 COMMODITY_LABELS = {
@@ -596,7 +675,7 @@ def build_update_message(ticker: str, quant: dict, news: dict, source: str, orig
     return "\n".join(lines)
 
 
-def build_alert_message(ticker: str, quant: dict, news: dict, source: str, display_price) -> str:
+def build_alert_message(ticker: str, quant: dict, news: dict, source: str, display_price, sentiment=None) -> str:
     total_score = quant["score"] + news["score"]
     label = "📌 Watchlist" if source == "watchlist" else "🔍 Scouting"
     lines = [f"<b>⚠️ Segnale su {ticker}</b> ({label})"]
@@ -616,6 +695,13 @@ def build_alert_message(ticker: str, quant: dict, news: dict, source: str, displ
         lines.append("Notizie correlate:")
         for t in news["matched_titles"]:
             lines.append(f"  - {t}")
+
+    if sentiment:
+        lines.append("")
+        lines.append(
+            f"📰 Sentiment notizie (Alpha Vantage): <b>{sentiment['label']}</b> "
+            f"(punteggio {sentiment['score']:+.2f}, da -1 molto negativo a +1 molto positivo)"
+        )
 
     lines += generate_action_commentary(quant, news)
 
@@ -668,7 +754,7 @@ def resolve_pending_predictions(cfg: dict):
             progress=False,
         )
     except Exception as e:
-        print(f"[ATTENZIONE] Impossibile scaricare i prezzi per la risoluzione: {e}")
+        log_warning(f"Impossibile scaricare i prezzi per la risoluzione: {e}")
         return
 
     current_prices = {}
@@ -679,7 +765,7 @@ def resolve_pending_predictions(cfg: dict):
             if not df.empty:
                 current_prices[t] = float(df["Close"].iloc[-1])
         except Exception as e:
-            print(f"[ATTENZIONE] Prezzo di risoluzione non disponibile per {t}: {e}")
+            log_warning(f"Prezzo di risoluzione non disponibile per {t}: {e}")
             continue
 
     resolved_count = 0
@@ -705,10 +791,42 @@ def resolve_pending_predictions(cfg: dict):
         print(f"[INFO] {resolved_count} previsioni risolte e salvate nello storico.")
 
 
+def get_scouted_tickers(cfg: dict, now: datetime) -> list:
+    """Restituisce i titoli "top mover" da usare in questo ciclo.
+
+    Per ridurre il carico su Yahoo Finance (la scansione di 500 titoli è la
+    parte più pesante), la rifacciamo solo ogni N minuti configurati
+    (scouting.refresh_minutes), riusando il risultato della cache negli
+    altri cicli. I dati giornalieri su cui si basa lo scouting non cambiano
+    comunque in modo significativo in pochi minuti."""
+    scouting_cfg = cfg.get("scouting", {})
+    if not scouting_cfg.get("enabled"):
+        return []
+
+    refresh_minutes = scouting_cfg.get("refresh_minutes", 15)
+    cache = load_scouting_cache()
+
+    if cache:
+        try:
+            cached_at = datetime.fromisoformat(cache["timestamp"])
+            age_minutes = (now - cached_at).total_seconds() / 60
+            if age_minutes < refresh_minutes:
+                print(f"[INFO] Riuso lo scouting di {age_minutes:.1f} minuti fa (aggiornamento ogni {refresh_minutes} min): {cache['tickers']}")
+                return cache["tickers"]
+        except Exception:
+            pass  # cache corrotta: rifacciamo la scansione
+
+    tickers = scout_top_movers(cfg)
+    save_scouting_cache(tickers, now)
+    return tickers
+
+
 def main():
     cfg = load_config()
     threshold = cfg["thresholds"]["alert_score_threshold"]
     now = datetime.now(timezone.utc)
+    RUN_STATS["errors"] = 0
+    RUN_STATS["warnings"] = 0
 
     # Prima di generare nuovi segnali, risolviamo le previsioni passate che
     # hanno raggiunto l'orizzonte configurato (serve al report di autovalutazione).
@@ -721,7 +839,7 @@ def main():
     log_changed = False
 
     watchlist = list(cfg.get("tickers", []))
-    scouted = scout_top_movers(cfg)
+    scouted = get_scouted_tickers(cfg, now)
     scouted_unique = [t for t in scouted if t not in watchlist]
 
     # Titoli con una previsione ancora aperta OGGI (es. trovati dallo
@@ -739,6 +857,7 @@ def main():
     )
 
     any_alert = False
+    alerts_sent = 0
 
     for ticker, source in all_targets:
         print(f"--- Analisi {ticker} ({source}) ---")
@@ -749,6 +868,7 @@ def main():
 
         if total_score >= threshold:
             any_alert = True
+            alerts_sent += 1
 
             # Prezzo istantaneo (endpoint di quotazione, gestisce pre/after-market):
             # usato per la VISUALIZZAZIONE e per il tracciamento del prezzo di
@@ -757,14 +877,17 @@ def main():
             instant_price = get_instant_quote(ticker)
             display_price = instant_price if instant_price is not None else quant.get("last_price")
             if instant_price is None:
-                print(f"[ATTENZIONE] Quotazione istantanea non disponibile per {ticker}, uso il prezzo dei dati storici come riserva.")
+                log_warning(f"Quotazione istantanea non disponibile per {ticker}, uso il prezzo dei dati storici come riserva.")
 
             existing_entry = find_todays_entry(ticker, all_entries, now)
 
             if existing_entry is None:
                 # Primo segnale di oggi su questo titolo: previsione nuova da tracciare.
+                # Il sentiment (se configurato) viene interrogato SOLO qui, non sugli
+                # aggiornamenti, per restare nel limite gratuito di Alpha Vantage.
                 bias = compute_bias(quant)
-                message = build_alert_message(ticker, quant, news, source, display_price)
+                sentiment = get_sentiment_score(ticker) if cfg.get("sentiment", {}).get("enabled", True) else None
+                message = build_alert_message(ticker, quant, news, source, display_price, sentiment)
                 send_telegram_message(message)
 
                 all_entries.append({
@@ -775,6 +898,7 @@ def main():
                     "score": total_score,
                     "factors": quant["factors"] + news["factors"],
                     "price_at_alert": display_price,
+                    "sentiment": sentiment,
                     "resolved": False,
                     "resolved_at": None,
                     "price_at_resolution": None,
@@ -809,6 +933,17 @@ def main():
     if log_changed:
         save_log(all_entries)
         print("[INFO] Storico previsioni aggiornato e salvato.")
+
+    # Log di salute operativa: permette al report giornaliero di mostrare
+    # quanti errori/warning ci sono stati, senza dover aprire i log grezzi
+    # di GitHub Actions.
+    append_health_entry({
+        "timestamp": now.isoformat(),
+        "targets_analyzed": len(all_targets),
+        "alerts_sent": alerts_sent,
+        "errors": RUN_STATS["errors"],
+        "warnings": RUN_STATS["warnings"],
+    })
 
     if not any_alert:
         print("Ciclo completato: nessun alert da inviare.")

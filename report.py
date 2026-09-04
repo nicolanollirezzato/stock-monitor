@@ -11,7 +11,7 @@ serve accesso a Yahoo Finance, solo a Telegram.
 
 from datetime import datetime, timedelta, timezone
 
-from common import load_log, send_telegram_message
+from common import load_log, load_health_log, send_telegram_message
 
 
 def compute_stats(entries: list, window: timedelta, now: datetime) -> dict:
@@ -54,8 +54,43 @@ def format_stats_block(title: str, stats: dict) -> list:
     return lines
 
 
+def compute_health_stats(health_entries: list, window: timedelta, now: datetime) -> dict:
+    """Aggrega il log di salute operativa (un run = una riga) sulla finestra
+    temporale indicata, per dare visibilità su errori/warning senza dover
+    aprire i log grezzi di GitHub Actions."""
+    in_window = []
+    for e in health_entries:
+        try:
+            ts = datetime.fromisoformat(e["timestamp"])
+        except Exception:
+            continue
+        if now - ts <= window:
+            in_window.append(e)
+
+    return {
+        "cicli": len(in_window),
+        "alert_inviati": sum(e.get("alerts_sent", 0) for e in in_window),
+        "errori": sum(e.get("errors", 0) for e in in_window),
+        "warning": sum(e.get("warnings", 0) for e in in_window),
+    }
+
+
+def format_health_block(stats: dict) -> list:
+    lines = ["<b>🔧 Salute del sistema (ultime 24 ore)</b>"]
+    if stats["cicli"] == 0:
+        lines.append("Nessuna esecuzione registrata nelle ultime 24 ore.")
+        return lines
+    lines.append(f"Cicli eseguiti: {stats['cicli']} · Alert inviati: {stats['alert_inviati']}")
+    if stats["errori"] or stats["warning"]:
+        lines.append(f"⚠️ Errori: {stats['errori']} · Avvisi: {stats['warning']} — controlla i log di Actions per il dettaglio.")
+    else:
+        lines.append("Nessun errore o avviso rilevato.")
+    return lines
+
+
 def main():
     entries = load_log()
+    health_entries = load_health_log()
     now = datetime.now(timezone.utc)
 
     if not entries:
@@ -69,11 +104,14 @@ def main():
 
     daily_stats = compute_stats(entries, timedelta(hours=24), now)
     weekly_stats = compute_stats(entries, timedelta(days=7), now)
+    health_stats = compute_health_stats(health_entries, timedelta(hours=24), now)
 
     lines = ["<b>📊 Report di autovalutazione</b>", ""]
     lines += format_stats_block("Ultime 24 ore", daily_stats)
     lines.append("")
     lines += format_stats_block("Ultimi 7 giorni", weekly_stats)
+    lines.append("")
+    lines += format_health_block(health_stats)
     lines.append("")
     lines.append(
         "ℹ️ \"Corretto\" = il prezzo si è mosso nella direzione indicata "
@@ -87,6 +125,7 @@ def main():
     print("Report inviato.")
     print(f"Statistiche 24h: {daily_stats}")
     print(f"Statistiche 7g: {weekly_stats}")
+    print(f"Salute sistema: {health_stats}")
 
 
 if __name__ == "__main__":

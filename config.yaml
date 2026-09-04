@@ -34,6 +34,12 @@ scouting:
   # (cattura i casi "balzo e rientro" che il solo cambio % giornaliero perde)
   min_intraday_range_pct: 3.0
 
+  # Ogni quanti minuti rifare la scansione completa dei 500 titoli, invece
+  # di riusare il risultato del ciclo precedente. I dati giornalieri su cui
+  # si basa lo scouting non cambiano molto in pochi minuti, quindi questo
+  # riduce il carico su Yahoo Finance senza perdere in pratica sensibilità.
+  refresh_minutes: 15
+
 # Soglie della checklist di valutazione
 thresholds:
   # Variazione percentuale di prezzo (intraday, ultimi ~5 minuti) che fa scattare un punto
@@ -57,23 +63,19 @@ thresholds:
   # Ogni fattore vale 1 punto (max 4: prezzo, volume, news, incrocio medie)
   alert_score_threshold: 2
 
-# Parole chiave (case-insensitive) per identificare notizie potenzialmente rilevanti
-# nei titoli dei feed RSS. Personalizza con nomi aziende, settori, eventi macro.
-news_keywords:
-  - earnings
-  - utili
-  - acquisizione
-  - merger
-  - fusione
-  - taglio tassi
-  - rate cut
-  - fed
-  - bce
-  - guidance
-  - profit warning
-  - sciopero
-  - lawsuit
-  - causa legale
+# Parole chiave (case-insensitive) OPZIONALI per filtrare ulteriormente le
+# notizie del singolo titolo (che arrivano già da Ticker.news, quindi già
+# pertinenti). Lascia la lista vuota per considerare rilevante qualunque
+# notizia recente associata al titolo, senza filtro aggiuntivo.
+news_keywords: []
+
+# =========================================================
+# SENTIMENT NOTIZIE (opzionale, richiede una chiave Alpha Vantage gratuita)
+# =========================================================
+sentiment:
+  # Se true ma manca la chiave ALPHA_VANTAGE_API_KEY (secret GitHub), viene
+  # semplicemente saltato: il resto dello strumento funziona normalmente.
+  enabled: true
 
 # =========================================================
 # AUTOVALUTAZIONE (tracking delle previsioni per il report)
@@ -143,14 +145,3 @@ commodities:
       url: "https://www.mining.com/feed/"
     - name: "Reuters Commodities"
       url: "https://feeds.reuters.com/reuters/commoditiesNews"
-
-# Feed RSS dei principali siti finanziari da controllare per le news sui singoli titoli
-rss_feeds:
-  - name: "Reuters Business"
-    url: "https://feeds.reuters.com/reuters/businessNews"
-  - name: "Il Sole 24 Ore - Finanza"
-    url: "https://www.ilsole24ore.com/rss/finanza.xml"
-  - name: "Yahoo Finance"
-    url: "https://finance.yahoo.com/news/rssindex"
-  - name: "MarketWatch Top Stories"
-    url: "https://feeds.content.dowjones.io/public/rss/mw_topstories"

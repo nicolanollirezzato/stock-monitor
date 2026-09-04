@@ -43,6 +43,10 @@ Aggiungi due secret:
 - `TELEGRAM_BOT_TOKEN` → il token ottenuto da BotFather
 - `TELEGRAM_CHAT_ID` → il chat_id ottenuto al punto 1.5
 
+Un terzo secret è **opzionale** (vedi sezione 7 più sotto per i dettagli):
+- `ALPHA_VANTAGE_API_KEY` → per il sentiment sulle notizie; se lo salti,
+  lo strumento funziona comunque normalmente, solo senza quella riga in più.
+
 ## 4. Personalizza `config.yaml`
 
 - Modifica la lista `tickers` con i titoli fissi che vuoi seguire sempre
@@ -277,7 +281,58 @@ universo più ristretto e meno aggiornato nel tempo rispetto all'intero
 indice. Se in futuro vuoi che la lista live torni a funzionare, si può
 correggere aggiungendo un User-Agent alla richiesta.
 
-## 7. Attiva entrambi i workflow
+## 7. Miglioramenti al workflow e alle notizie
+
+### Scouting con cadenza propria (cache)
+
+Lo scouting sull'intero S&P 500 (la parte più pesante) non viene più
+rifatto ad ogni ciclo di 5 minuti, ma solo ogni `scouting.refresh_minutes`
+minuti (default 15) — nei cicli intermedi si riusa il risultato salvato in
+`data/scouting_cache.json`. Riduce il carico su Yahoo Finance senza perdere
+sensibilità pratica, dato che i dati giornalieri su cui si basa lo
+scouting non cambiano molto in pochi minuti.
+
+### Notizie: da RSS+parole chiave a `Ticker.news`
+
+Il controllo notizie sul singolo titolo ora usa `Ticker.news` di yfinance
+(già taggate da Yahoo per quel titolo specifico) invece di cercare parole
+chiave in feed RSS generici — elimina sia i falsi positivi (keyword
+trovata ma articolo non pertinente) sia i falsi negativi (notizia
+pertinente ma parola chiave non prevista). Il filtro per parole chiave
+(`news_keywords` in config.yaml) resta disponibile come filtro aggiuntivo
+opzionale, vuoto di default (qualunque notizia recente sul titolo conta).
+
+Le materie prime restano sui feed RSS di prima, perché non hanno un
+"ticker" a cui agganciare una ricerca dedicata come `Ticker.news`.
+
+### Sentiment opzionale (Alpha Vantage)
+
+Se configuri una chiave gratuita Alpha Vantage, ogni **nuovo** segnale di
+giornata (non gli aggiornamenti) include anche un punteggio di sentiment
+reale (Bullish/Bearish/Neutral), invece del generico "verifica tu stesso
+il contenuto". Per registrarti:
+
+1. Vai su [alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key)
+   e richiedi una chiave gratuita (bastano nome ed email)
+2. Aggiungi un nuovo secret nel repository: `ALPHA_VANTAGE_API_KEY`
+
+**Limite gratuito: 25 richieste al giorno.** Per questo la chiamata avviene
+SOLO sui nuovi segnali (non sugli aggiornamenti dello stesso titolo in
+giornata) — con le soglie di default, il numero di nuovi segnali al giorno
+resta ampiamente sotto quel limite. Se preferisci non registrarti, lascia
+il secret non impostato: il resto dello strumento funziona normalmente,
+semplicemente senza quella riga aggiuntiva nei messaggi.
+
+### Log di salute operativa
+
+Ogni ciclo registra in `data/health_log.jsonl` quanti titoli ha
+analizzato, quanti alert ha inviato e quanti errori/avvisi ha incontrato.
+Il report giornaliero (`report.py`) ora include una sezione "🔧 Salute del
+sistema" con questi numeri delle ultime 24 ore, così puoi accorgerti di
+problemi (es. errori di rete ripetuti) senza dover aprire i log grezzi di
+GitHub Actions ogni volta.
+
+## 8. Attiva entrambi i workflow
 
 1. Vai nella tab **Actions** del repository.
 2. Se richiesto, abilita i workflow.

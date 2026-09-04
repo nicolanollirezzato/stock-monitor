@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
 LOG_PATH = os.path.join(BASE_DIR, "data", "alerts_log.jsonl")
+HEALTH_LOG_PATH = os.path.join(BASE_DIR, "data", "health_log.jsonl")
+SCOUTING_CACHE_PATH = os.path.join(BASE_DIR, "data", "scouting_cache.json")
 
 # Orario di borsa USA (NYSE/Nasdaq), usato per "pesare" correttamente il
 # volume a metà giornata invece di confrontarlo con una media di giorni interi.
@@ -116,3 +118,74 @@ def save_log(entries: list, max_age_days: int = 120):
     with open(LOG_PATH, "w", encoding="utf-8") as f:
         for e in pruned:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def append_health_entry(entry: dict, max_age_days: int = 30):
+    """Aggiunge una riga al log di salute operativa (un run = una riga),
+    scartando quelle più vecchie di max_age_days per non farlo crescere
+    all'infinito. Usato dal report per mostrare quanti errori/alert ci
+    sono stati, senza dover consultare i log grezzi di GitHub Actions."""
+    os.makedirs(os.path.dirname(HEALTH_LOG_PATH), exist_ok=True)
+    entries = []
+    if os.path.exists(HEALTH_LOG_PATH):
+        with open(HEALTH_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    now = datetime.now(timezone.utc)
+    pruned = []
+    for e in entries:
+        try:
+            ts = datetime.fromisoformat(e["timestamp"])
+            if now - ts <= timedelta(days=max_age_days):
+                pruned.append(e)
+        except Exception:
+            pruned.append(e)
+
+    pruned.append(entry)
+
+    with open(HEALTH_LOG_PATH, "w", encoding="utf-8") as f:
+        for e in pruned:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def load_health_log() -> list:
+    """Carica il log di salute operativa. Lista vuota se non esiste ancora."""
+    if not os.path.exists(HEALTH_LOG_PATH):
+        return []
+    entries = []
+    with open(HEALTH_LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries
+
+
+def load_scouting_cache():
+    """Carica l'ultimo risultato di scouting salvato (ticker + orario), per
+    poterlo riusare nei cicli in cui non rifacciamo la scansione completa.
+    Restituisce None se non esiste o è corrotto."""
+    if not os.path.exists(SCOUTING_CACHE_PATH):
+        return None
+    try:
+        with open(SCOUTING_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_scouting_cache(tickers: list, timestamp: datetime):
+    os.makedirs(os.path.dirname(SCOUTING_CACHE_PATH), exist_ok=True)
+    with open(SCOUTING_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"timestamp": timestamp.isoformat(), "tickers": tickers}, f)
