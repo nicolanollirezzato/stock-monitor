@@ -28,6 +28,7 @@ from common import (
     load_config,
     trading_day_fraction_elapsed,
     send_telegram_message,
+    NY_TZ,
     load_log,
     save_log,
 )
@@ -151,6 +152,7 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
         "reasons": [],
         "bullish_signals": [],
         "bearish_signals": [],
+        "factors": [],  # elenco strutturato {code, direction} per analisi future per-fattore
         "last_price": None,
     }
 
@@ -176,7 +178,9 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
                 direzione = "rialzo" if change_5m_pct > 0 else "ribasso"
                 detail = f"Movimento rapido: {change_5m_pct:+.2f}% negli ultimi 5 min ({direzione})."
                 result["reasons"].append(detail)
+                fdir = "bullish" if change_5m_pct > 0 else "bearish"
                 (result["bullish_signals"] if change_5m_pct > 0 else result["bearish_signals"]).append(detail)
+                result["factors"].append({"code": "price_5m", "direction": fdir})
 
         # --- Fattore 2: variazione prezzo giornaliera ---
         today_open = float(daily["Open"].iloc[-1])
@@ -186,7 +190,9 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
             direzione = "rialzo" if change_1d_pct > 0 else "ribasso"
             detail = f"Variazione giornaliera: {change_1d_pct:+.2f}% ({direzione})."
             result["reasons"].append(detail)
+            fdir = "bullish" if change_1d_pct > 0 else "bearish"
             (result["bullish_signals"] if change_1d_pct > 0 else result["bearish_signals"]).append(detail)
+            result["factors"].append({"code": "price_1d", "direction": fdir})
 
         # --- Fattore 3: volume anomalo (corretto per l'orario di borsa) ---
         avg_volume = daily["Volume"].iloc[:-1].mean()
@@ -199,6 +205,7 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
                 result["reasons"].append(
                     f"Volume anomalo: {volume_ratio:.1f}x rispetto all'atteso per quest'ora."
                 )
+                result["factors"].append({"code": "volume", "direction": "neutral"})
 
         # --- Fattore 4: incrocio medie mobili (SMA breve vs lunga) ---
         short_p = cfg["thresholds"]["sma_short"]
@@ -218,11 +225,13 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
                 detail = f"Incrocio rialzista: media mobile {short_p}gg ha superato quella a {long_p}gg."
                 result["reasons"].append(detail)
                 result["bullish_signals"].append(detail)
+                result["factors"].append({"code": "sma_cross", "direction": "bullish"})
             elif crossed_down:
                 result["score"] += 1
                 detail = f"Incrocio ribassista: media mobile {short_p}gg è scesa sotto quella a {long_p}gg."
                 result["reasons"].append(detail)
                 result["bearish_signals"].append(detail)
+                result["factors"].append({"code": "sma_cross", "direction": "bearish"})
 
     except Exception as e:
         result["reasons"].append(f"Errore durante l'analisi quantitativa: {e}")
@@ -233,7 +242,7 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
 def check_relevant_news(ticker: str, cfg: dict) -> dict:
     """Controlla i feed RSS configurati per notizie recenti con parole chiave rilevanti
     per il singolo titolo."""
-    result = {"score": 0, "reasons": [], "matched_titles": []}
+    result = {"score": 0, "reasons": [], "matched_titles": [], "factors": []}
 
     lookback = timedelta(hours=cfg["thresholds"]["news_lookback_hours"])
     now = datetime.now(timezone.utc)
@@ -271,6 +280,9 @@ def check_relevant_news(ticker: str, cfg: dict) -> dict:
             f"{cfg['thresholds']['news_lookback_hours']} ore."
         )
         result["matched_titles"] = matches[:5]
+        # Direzione "neutral": il matching per parole chiave non permette di
+        # stabilire se la notizia sia positiva o negativa per il prezzo.
+        result["factors"].append({"code": "news", "direction": "neutral"})
 
     return result
 
@@ -433,6 +445,65 @@ def generate_action_commentary(quant: dict, news: dict) -> list:
     return lines
 
 
+def is_same_ny_day(iso_timestamp: str, reference: datetime) -> bool:
+    """Confronta se un timestamp ISO cade nello stesso giorno di borsa
+    (calendario di New York) del momento di riferimento."""
+    try:
+        ts = datetime.fromisoformat(iso_timestamp)
+    except Exception:
+        return False
+    return ts.astimezone(NY_TZ).date() == reference.astimezone(NY_TZ).date()
+
+
+def find_todays_entry(ticker: str, entries: list, now: datetime):
+    """Cerca nello storico una previsione già registrata OGGI per questo
+    ticker (a prescindere dalla provenienza watchlist/scouting): se c'è,
+    un nuovo segnale sullo stesso titolo va trattato come "aggiornamento"
+    invece che come previsione nuova, per non duplicare il tracciamento
+    nel report di autovalutazione."""
+    for e in entries:
+        if e.get("ticker") == ticker and is_same_ny_day(e.get("timestamp", ""), now):
+            return e
+    return None
+
+
+def build_update_message(ticker: str, quant: dict, news: dict, source: str, original_entry: dict) -> str:
+    """Messaggio "leggero" per un titolo già segnalato oggi: mostra la
+    fluttuazione rispetto al primo segnale, SENZA generare una nuova
+    previsione da tracciare (quella originale resta quella valida)."""
+    label = "📌 Watchlist" if source == "watchlist" else "🔍 Scouting"
+    lines = [f"<b>🔄 Aggiornamento su {ticker}</b> ({label})"]
+
+    original_price = original_entry.get("price_at_alert")
+    try:
+        orario_primo_segnale = datetime.fromisoformat(original_entry["timestamp"]).astimezone(NY_TZ).strftime("%H:%M")
+    except Exception:
+        orario_primo_segnale = "N/D"
+
+    if original_price is not None:
+        lines.append(f"Primo segnale oggi: {orario_primo_segnale} (prezzo {original_price})")
+
+    current_price = quant.get("last_price")
+    if current_price is not None and original_price:
+        delta_pct = (current_price - original_price) / original_price * 100
+        lines.append(f"Prezzo attuale: {current_price} ({delta_pct:+.2f}% dal primo segnale)")
+    elif current_price is not None:
+        lines.append(f"Prezzo attuale: {current_price}")
+
+    lines.append(f"Punteggio checklist: {quant['score'] + news['score']}")
+    lines.append("")
+    for r in quant["reasons"] + news["reasons"]:
+        lines.append(f"• {r}")
+
+    lines.append("")
+    lines.append(
+        f"ℹ️ La previsione originale (<b>{original_entry.get('bias', 'n/d')}</b>, delle "
+        f"{orario_primo_segnale}) resta quella monitorata per l'autovalutazione — questo "
+        "è solo un aggiornamento informativo e non genera una nuova previsione da verificare."
+    )
+    return "\n".join(lines)
+
+
 def build_alert_message(ticker: str, quant: dict, news: dict, source: str) -> str:
     total_score = quant["score"] + news["score"]
     label = "📌 Watchlist" if source == "watchlist" else "🔍 Scouting"
@@ -539,10 +610,17 @@ def resolve_pending_predictions(cfg: dict):
 def main():
     cfg = load_config()
     threshold = cfg["thresholds"]["alert_score_threshold"]
+    now = datetime.now(timezone.utc)
 
     # Prima di generare nuovi segnali, risolviamo le previsioni passate che
     # hanno raggiunto l'orizzonte configurato (serve al report di autovalutazione).
     resolve_pending_predictions(cfg)
+
+    # Carichiamo lo storico UNA volta: lo aggiorniamo in memoria (sia con
+    # nuove previsioni sia con aggiornamenti a previsioni di oggi già
+    # esistenti) e lo salviamo con una sola scrittura a fine ciclo.
+    all_entries = load_log()
+    log_changed = False
 
     watchlist = list(cfg.get("tickers", []))
     scouted = scout_top_movers(cfg)
@@ -550,7 +628,6 @@ def main():
     all_targets = [(t, "watchlist") for t in watchlist] + [(t, "scouting") for t in scouted_unique]
 
     any_alert = False
-    new_log_entries = []
 
     for ticker, source in all_targets:
         print(f"--- Analisi {ticker} ({source}) ---")
@@ -561,22 +638,43 @@ def main():
 
         if total_score >= threshold:
             any_alert = True
-            bias = compute_bias(quant)
-            message = build_alert_message(ticker, quant, news, source)
-            send_telegram_message(message)
+            existing_entry = find_todays_entry(ticker, all_entries, now)
 
-            new_log_entries.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "ticker": ticker,
-                "source": source,
-                "bias": bias,
-                "score": total_score,
-                "price_at_alert": quant.get("last_price"),
-                "resolved": False,
-                "resolved_at": None,
-                "price_at_resolution": None,
-                "outcome": None,
-            })
+            if existing_entry is None:
+                # Primo segnale di oggi su questo titolo: previsione nuova da tracciare.
+                bias = compute_bias(quant)
+                message = build_alert_message(ticker, quant, news, source)
+                send_telegram_message(message)
+
+                all_entries.append({
+                    "timestamp": now.isoformat(),
+                    "ticker": ticker,
+                    "source": source,
+                    "bias": bias,
+                    "score": total_score,
+                    "factors": quant["factors"] + news["factors"],
+                    "price_at_alert": quant.get("last_price"),
+                    "resolved": False,
+                    "resolved_at": None,
+                    "price_at_resolution": None,
+                    "outcome": None,
+                    "update_count": 0,
+                    "last_update_at": None,
+                    "last_update_price": None,
+                })
+                log_changed = True
+                print(f"[INFO] Nuovo segnale registrato per {ticker}.")
+            else:
+                # Titolo già segnalato oggi: aggiornamento informativo, la
+                # previsione originale (bias/prezzo/esito) NON viene toccata.
+                message = build_update_message(ticker, quant, news, source, existing_entry)
+                send_telegram_message(message)
+
+                existing_entry["update_count"] = existing_entry.get("update_count", 0) + 1
+                existing_entry["last_update_at"] = now.isoformat()
+                existing_entry["last_update_price"] = quant.get("last_price")
+                log_changed = True
+                print(f"[INFO] Aggiornamento (n. {existing_entry['update_count']}) per {ticker}, previsione originale invariata.")
         else:
             print("Nessun segnale rilevante al momento.")
 
@@ -587,11 +685,9 @@ def main():
         send_telegram_message(build_commodity_alert_message(commodity_result["triggered"]))
         print(f"[INFO] Alert materie prime inviato: {list(commodity_result['triggered'].keys())}")
 
-    # Registriamo le nuove previsioni nello storico (una sola lettura/scrittura per ciclo)
-    if new_log_entries:
-        existing = load_log()
-        save_log(existing + new_log_entries)
-        print(f"[INFO] {len(new_log_entries)} nuove previsioni registrate nello storico.")
+    if log_changed:
+        save_log(all_entries)
+        print("[INFO] Storico previsioni aggiornato e salvato.")
 
     if not any_alert:
         print("Ciclo completato: nessun alert da inviare.")
