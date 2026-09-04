@@ -1,0 +1,2 @@
+{"timestamp": "2026-09-04T11:46:38.895992+00:00", "ticker": "ORCL", "source": "scouting", "bias": "rialzista", "score": 2, "price_at_alert": 154.05, "resolved": false, "resolved_at": null, "price_at_resolution": null, "outcome": null}
+{"timestamp": "2026-09-04T11:46:39.783526+00:00", "ticker": "NOW", "source": "scouting", "bias": "rialzista", "score": 2, "price_at_alert": 145.55, "resolved": false, "resolved_at": null, "price_at_resolution": null, "outcome": null}
