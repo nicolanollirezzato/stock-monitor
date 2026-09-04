@@ -332,7 +332,38 @@ sistema" con questi numeri delle ultime 24 ore, così puoi accorgerti di
 problemi (es. errori di rete ripetuti) senza dover aprire i log grezzi di
 GitHub Actions ogni volta.
 
-## 8. Attiva entrambi i workflow
+## 8. Rilevamento di cambi repentini (soglie adattive)
+
+Tre correzioni mirate a cogliere meglio i movimenti improvvisi, entro il
+vincolo tecnico che **GitHub Actions non esegue cron più frequenti di 5
+minuti** (limite della piattaforma, non una scelta di configurazione) — un
+vero flusso dati continuo (streaming) richiederebbe sia una fonte dati
+diversa da Yahoo Finance (che non offre streaming, solo dati a richiesta)
+sia un processo sempre acceso ospitato altrove, non su GitHub Actions: un
+progetto a sé, non una modifica di questo codice.
+
+**1. Soglie adattive alla volatilità storica** (fattori "movimento 5 minuti"
+e "variazione giornaliera"): invece di un numero fisso identico per tutti
+i titoli, la soglia è ora calcolata sulla deviazione standard dei
+rendimenti storici del singolo titolo — un +1.5% è un evento notevole per
+un titolo tipicamente calmo, ordinario per uno tipicamente volatile.
+Configurabile in `thresholds.volatility_multiplier` (default 2.0 deviazioni
+standard), con un pavimento minimo (`*_floor_pct`) per evitare falsi
+allarmi sui titoli storicamente molto calmi. Se non c'è abbastanza storico
+(es. titolo appena quotato), ripiega sui vecchi valori fissi.
+
+**2. Scouting ogni 5 minuti** invece che ogni 15 (`scouting.refresh_minutes`
+in config.yaml): privilegia la prontezza nel cogliere nuovi titoli in
+movimento, al costo di un carico leggermente maggiore su Yahoo Finance.
+
+**3. Fattore "movimento rapido" su finestra più ampia**: oltre a
+confrontare l'ultima barra da 5 minuti con la precedente, ora guarda anche
+un accumulo su più barre consecutive (default 4 = ~20 minuti,
+`thresholds.price_5m_window_bars`) — cattura anche i movimenti "a scalini"
+che singolarmente non supererebbero mai la soglia ma che nell'insieme
+rappresentano un vero cambiamento repentino.
+
+## 9. Attiva entrambi i workflow
 
 1. Vai nella tab **Actions** del repository.
 2. Se richiesto, abilita i workflow.
@@ -403,6 +434,16 @@ vorrà svilupparle:
   "sotto osservazione ravvicinata" dopo l'alert iniziale (fino a chiusura
   mercato? un numero fisso di ore?) e come evitare che diventi eccessivo
   se il titolo resta volatile tutto il giorno.
+
+- **Streaming continuo invece del polling**: sostituire il controllo
+  periodico (ogni 5 minuti, minimo tecnico di GitHub Actions) con un vero
+  flusso dati continuo che generi alert immediati sui cambi di prezzo.
+  Valutato e scartato per ora: richiederebbe sia una fonte dati con
+  streaming reale via WebSocket (Yahoo Finance/yfinance non lo offre;
+  Finnhub o Alpaca hanno un livello gratuito con WebSocket per azioni USA)
+  sia un processo sempre acceso ospitato altrove (non GitHub Actions, che
+  non è pensato per processi persistenti) — un progetto a sé con una vera
+  componente di gestione server, non una modifica del codice attuale.
 
 - **Agente di analisi delle performance**: uno script/report che legga lo
   storico e lo scomponga per fattore attivato (usando il campo `factors`,

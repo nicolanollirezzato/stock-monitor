@@ -208,6 +208,41 @@ def get_instant_quote(ticker: str):
     return None
 
 
+def compute_daily_volatility_pct(daily_df):
+    """Deviazione standard dei rendimenti percentuali giornalieri (close-to-
+    close) sugli ultimi ~60 giorni. Usata per calibrare le soglie di prezzo
+    sulla volatilità storica del singolo titolo, invece di un numero fisso
+    identico per tutti (un +3% è enorme per un titolo storicamente calmo,
+    ordinario per uno storicamente volatile).
+
+    Restituisce None se non ci sono abbastanza dati (es. titolo appena
+    quotato): chi chiama questa funzione deve prevedere un fallback.
+    """
+    closes = daily_df["Close"].dropna()
+    if len(closes) < 15:
+        return None
+    returns_pct = closes.pct_change().dropna() * 100
+    if returns_pct.empty:
+        return None
+    return float(returns_pct.std())
+
+
+def adaptive_threshold(daily_volatility_pct, floor_pct: float, multiplier: float, fallback_pct: float, scale: float = 1.0) -> float:
+    """Calcola la soglia effettiva per un fattore di prezzo.
+
+    Se abbiamo abbastanza storia per stimare la volatilità, la soglia è il
+    MASSIMO tra un pavimento minimo (evita falsi allarmi su titoli
+    ultra-calmi dove anche un movimento minimo sarebbe "statisticamente"
+    anomalo) e "multiplier" deviazioni standard della volatilità stimata
+    (eventualmente scalata, es. per passare da giornaliera a 5 minuti).
+    Se non c'è abbastanza storia, ripiega sul valore fisso di configurazione.
+    """
+    if daily_volatility_pct is None:
+        return fallback_pct
+    estimated_vol = daily_volatility_pct * scale
+    return max(floor_pct, multiplier * estimated_vol)
+
+
 def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
     """Scarica dati intraday e giornalieri e calcola i segnali quantitativi.
 
@@ -244,27 +279,69 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
         last_price = float(intraday["Close"].iloc[-1])
         result["last_price"] = round(last_price, 2)
 
-        # --- Fattore 1: variazione prezzo ultimi 5 minuti ---
+        # Volatilità storica del titolo, usata per calibrare le soglie dei
+        # fattori 1 e 2 (vedi adaptive_threshold). Se non ci sono abbastanza
+        # dati, le funzioni ripiegano sui valori fissi di configurazione.
+        daily_volatility_pct = compute_daily_volatility_pct(daily)
+        vol_multiplier = cfg["thresholds"].get("volatility_multiplier", 2.0)
+
+        # --- Fattore 1: variazione prezzo rapida (immediata E su finestra più ampia) ---
+        # Guardiamo sia l'ultima barra da 5 min sia una finestra più ampia
+        # (default 4 barre = ~20 min): cattura sia lo scatto improvviso in
+        # un colpo solo, sia un accumulo "a scalini" su più barre consecutive
+        # che singolarmente non supererebbero mai la soglia.
+        window_bars = cfg["thresholds"].get("price_5m_window_bars", 4)
+        threshold_5m = adaptive_threshold(
+            daily_volatility_pct,
+            floor_pct=cfg["thresholds"].get("price_change_5m_floor_pct", 0.15),
+            multiplier=vol_multiplier,
+            fallback_pct=cfg["thresholds"]["price_change_5m_pct"],
+            scale=1 / (78 ** 0.5),  # ~78 barre da 5 min in una sessione regolare di 6.5 ore
+        )
+
+        change_5m_pct = 0.0
         if len(intraday) >= 2:
             prev_price = float(intraday["Close"].iloc[-2])
             change_5m_pct = (last_price - prev_price) / prev_price * 100
-            if abs(change_5m_pct) >= cfg["thresholds"]["price_change_5m_pct"]:
-                result["score"] += 1
-                direzione = "rialzo" if change_5m_pct > 0 else "ribasso"
-                detail = f"Movimento rapido: {change_5m_pct:+.2f}% negli ultimi 5 min ({direzione})."
-                result["reasons"].append(detail)
-                fdir = "bullish" if change_5m_pct > 0 else "bearish"
-                (result["bullish_signals"] if change_5m_pct > 0 else result["bearish_signals"]).append(detail)
-                result["factors"].append({"code": "price_5m", "direction": fdir})
 
-        # --- Fattore 2: variazione prezzo giornaliera ---
+        change_window_pct = 0.0
+        if len(intraday) > window_bars:
+            price_n_bars_ago = float(intraday["Close"].iloc[-window_bars - 1])
+            change_window_pct = (last_price - price_n_bars_ago) / price_n_bars_ago * 100
+
+        # Usiamo il movimento più marcato tra i due per decidere se il
+        # fattore scatta, ma mostriamo entrambi i numeri nel messaggio.
+        significant_pct = change_5m_pct if abs(change_5m_pct) >= abs(change_window_pct) else change_window_pct
+
+        if abs(significant_pct) >= threshold_5m:
+            result["score"] += 1
+            direzione = "rialzo" if significant_pct > 0 else "ribasso"
+            detail = (
+                f"Movimento rapido: {change_5m_pct:+.2f}% negli ultimi 5 min, "
+                f"{change_window_pct:+.2f}% negli ultimi {window_bars * 5} min ({direzione}, "
+                f"soglia {threshold_5m:.2f}%)."
+            )
+            result["reasons"].append(detail)
+            fdir = "bullish" if significant_pct > 0 else "bearish"
+            (result["bullish_signals"] if significant_pct > 0 else result["bearish_signals"]).append(detail)
+            result["factors"].append({"code": "price_5m", "direction": fdir})
+
+        # --- Fattore 2: variazione prezzo giornaliera (soglia adattiva) ---
         today_open = float(daily["Open"].iloc[-1])
         result["today_open"] = today_open
         change_1d_pct = (last_price - today_open) / today_open * 100
-        if abs(change_1d_pct) >= cfg["thresholds"]["price_change_1d_pct"]:
+
+        threshold_1d = adaptive_threshold(
+            daily_volatility_pct,
+            floor_pct=cfg["thresholds"].get("price_change_1d_floor_pct", 1.0),
+            multiplier=vol_multiplier,
+            fallback_pct=cfg["thresholds"]["price_change_1d_pct"],
+        )
+
+        if abs(change_1d_pct) >= threshold_1d:
             result["score"] += 1
             direzione = "rialzo" if change_1d_pct > 0 else "ribasso"
-            detail = f"Variazione giornaliera: {change_1d_pct:+.2f}% ({direzione})."
+            detail = f"Variazione giornaliera: {change_1d_pct:+.2f}% ({direzione}, soglia {threshold_1d:.2f}%)."
             result["reasons"].append(detail)
             fdir = "bullish" if change_1d_pct > 0 else "bearish"
             (result["bullish_signals"] if change_1d_pct > 0 else result["bearish_signals"]).append(detail)
@@ -490,10 +567,6 @@ def build_commodity_alert_message(triggered: dict) -> str:
         for m in matches:
             lines.append(f"  • {m}")
         lines.append("")
-    lines.append(
-        "⚠️ Match per parole chiave, non per sentiment: leggi i titoli prima "
-        "di interpretarli come positivi o negativi per i prezzi."
-    )
     return "\n".join(lines)
 
 
@@ -563,21 +636,6 @@ def generate_action_commentary(quant: dict, news: dict) -> list:
             "rialzisti e ribassisti in pari numero). In casi così, spesso "
             "conviene attendere ulteriori conferme prima di agire."
         )
-
-    if news.get("matched_titles"):
-        lines.append(
-            "⚠️ Le notizie sono individuate per parole chiave, NON per "
-            "sentiment: leggi i titoli prima di interpretarli come positivi "
-            "o negativi (es. 'acquisizione' può riferirsi a un'acquisizione "
-            "saltata, non conclusa)."
-        )
-
-    lines.append(
-        "🚫 Non è un consiglio di investimento: è un'interpretazione "
-        "automatica di regole tecniche semplici, che non conosce il tuo "
-        "portafoglio né la tua tolleranza al rischio. Verifica sempre in "
-        "autonomia o consulta un consulente finanziario abilitato."
-    )
 
     return lines
 

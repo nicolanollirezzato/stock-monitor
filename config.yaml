@@ -35,18 +35,43 @@ scouting:
   min_intraday_range_pct: 3.0
 
   # Ogni quanti minuti rifare la scansione completa dei 500 titoli, invece
-  # di riusare il risultato del ciclo precedente. I dati giornalieri su cui
-  # si basa lo scouting non cambiano molto in pochi minuti, quindi questo
-  # riduce il carico su Yahoo Finance senza perdere in pratica sensibilità.
-  refresh_minutes: 15
+  # di riusare il risultato del ciclo precedente. Impostato a 5 (= ogni
+  # ciclo) per privilegiare la prontezza nel cogliere cambi repentini;
+  # aumenta questo numero se preferissi ridurre il carico su Yahoo Finance
+  # a scapito di un po' di reattività.
+  refresh_minutes: 5
 
 # Soglie della checklist di valutazione
 thresholds:
-  # Variazione percentuale di prezzo (intraday, ultimi ~5 minuti) che fa scattare un punto
+  # Variazione percentuale di prezzo (intraday, ultimi ~5 minuti) usata SOLO
+  # come riserva se non c'è abbastanza storico per calcolare una soglia
+  # adattiva (vedi sotto). Normalmente la soglia reale è calcolata sulla
+  # volatilità storica del singolo titolo, non su questo numero fisso.
   price_change_5m_pct: 0.5
 
-  # Variazione percentuale di prezzo nella giornata corrente
+  # Variazione percentuale di prezzo giornaliera, stessa logica di riserva
+  # (soglia reale normalmente adattiva, vedi sotto).
   price_change_1d_pct: 3.0
+
+  # --- Soglie adattive alla volatilità storica (fattori 1 e 2) ---
+  # Un titolo scatta quando il movimento supera "volatility_multiplier"
+  # deviazioni standard della sua volatilità storica (calcolata sui
+  # rendimenti giornalieri degli ultimi ~60 giorni), invece di un numero
+  # fisso identico per tutti i titoli. 2.0 = cattura all'incirca il 5% dei
+  # movimenti giornalieri più insoliti per quel singolo titolo.
+  volatility_multiplier: 2.0
+
+  # Pavimenti minimi: anche se la volatilità storica del titolo è bassissima,
+  # non scattare sotto queste percentuali (evita falsi allarmi rumorosi sui
+  # titoli storicamente molto calmi).
+  price_change_5m_floor_pct: 0.15
+  price_change_1d_floor_pct: 1.0
+
+  # Quante barre da 5 minuti guardare indietro per il fattore "movimento
+  # rapido", oltre all'ultima singola barra: cattura anche un accumulo "a
+  # scalini" su più barre consecutive che singolarmente non supererebbero
+  # mai la soglia. 4 barre = ~20 minuti.
+  price_5m_window_bars: 4
 
   # Volume attuale / volume medio storico (es. 2.0 = doppio del normale)
   volume_spike_ratio: 2.0
