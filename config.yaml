@@ -1,0 +1,81 @@
+# =========================================================
+# CONFIGURAZIONE STRUMENTO DI MONITORAGGIO AZIONI
+# =========================================================
+
+# Elenco dei ticker da monitorare SEMPRE, indipendentemente dallo scouting
+# (formato Yahoo Finance, es. AAPL, MSFT, NVDA)
+tickers:
+  - AAPL
+  - MSFT
+  - NVDA
+
+# =========================================================
+# SCOUTING AUTOMATICO (ricerca di nuove opportunità)
+# =========================================================
+scouting:
+  enabled: true
+
+  # Universo su cui cercare: per ora supportato "sp500" (S&P 500, mercato USA)
+  universe: sp500
+
+  # Quanti titoli "top mover" del momento passare alla checklist dettagliata
+  # ad ogni ciclo (oltre a quelli della watchlist fissa)
+  top_n: 10
+
+  # Peso minimo di variazione % giornaliera per essere considerato interessante
+  min_abs_change_pct: 2.0
+
+  # Rapporto volume attuale / media che rende un titolo interessante per lo scouting
+  min_volume_ratio: 1.5
+
+# Soglie della checklist di valutazione
+thresholds:
+  # Variazione percentuale di prezzo (intraday, ultimi ~5 minuti) che fa scattare un punto
+  price_change_5m_pct: 0.5
+
+  # Variazione percentuale di prezzo nella giornata corrente
+  price_change_1d_pct: 3.0
+
+  # Volume attuale / volume medio storico (es. 2.0 = doppio del normale)
+  volume_spike_ratio: 2.0
+
+  # Numero di notizie rilevanti trovate nelle ultime N ore per considerarle un fattore
+  news_lookback_hours: 6
+  news_min_count: 2
+
+  # Periodo medie mobili (in giorni) per il segnale tecnico
+  sma_short: 5
+  sma_long: 20
+
+  # Punteggio minimo (somma dei fattori attivati) per inviare un alert Telegram
+  # Ogni fattore vale 1 punto (max 4: prezzo, volume, news, incrocio medie)
+  alert_score_threshold: 2
+
+# Parole chiave (case-insensitive) per identificare notizie potenzialmente rilevanti
+# nei titoli dei feed RSS. Personalizza con nomi aziende, settori, eventi macro.
+news_keywords:
+  - earnings
+  - utili
+  - acquisizione
+  - merger
+  - fusione
+  - taglio tassi
+  - rate cut
+  - fed
+  - bce
+  - guidance
+  - profit warning
+  - sciopero
+  - lawsuit
+  - causa legale
+
+# Feed RSS dei principali siti finanziari da controllare per le news
+rss_feeds:
+  - name: "Reuters Business"
+    url: "https://feeds.reuters.com/reuters/businessNews"
+  - name: "Il Sole 24 Ore - Finanza"
+    url: "https://www.ilsole24ore.com/rss/finanza.xml"
+  - name: "Yahoo Finance"
+    url: "https://finance.yahoo.com/news/rssindex"
+  - name: "MarketWatch Top Stories"
+    url: "https://feeds.content.dowjones.io/public/rss/mw_topstories"
