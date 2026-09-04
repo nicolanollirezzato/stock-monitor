@@ -76,12 +76,16 @@ def scout_top_movers(cfg: dict) -> list:
     print(f"[INFO] Scouting su {len(universe)} titoli dell'universo {universe_name}...")
 
     try:
+        # threads=False (non il default): con molti titoli in parallelo,
+        # yfinance usa una cache SQLite interna che su Ubuntu/GitHub Actions
+        # può bloccarsi con errori "database is locked", causando fallimenti
+        # silenziosi per alcuni titoli. Più lento ma affidabile.
         data = yf.download(
             tickers=universe,
             period="25d",
             interval="1d",
             group_by="ticker",
-            threads=True,
+            threads=False,
             progress=False,
         )
     except Exception as e:
@@ -91,11 +95,13 @@ def scout_top_movers(cfg: dict) -> list:
     day_fraction = trading_day_fraction_elapsed()
 
     candidates = []
+    falliti = []
     for ticker in universe:
         try:
             df = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
             df = df.dropna()
             if len(df) < 2:
+                falliti.append(ticker)
                 continue
 
             last_close = float(df["Close"].iloc[-1])
@@ -121,8 +127,12 @@ def scout_top_movers(cfg: dict) -> list:
             if passes_change or passes_volume or passes_range:
                 interest_score = abs(change_pct) + volume_ratio + intraday_range_pct
                 candidates.append((ticker, interest_score, change_pct, volume_ratio, intraday_range_pct))
-        except Exception:
+        except Exception as e:
+            falliti.append(ticker)
             continue
+
+    if falliti:
+        print(f"[ATTENZIONE] Dati mancanti/non validi per {len(falliti)} titoli su {len(universe)} nello scouting: {falliti[:15]}{'...' if len(falliti) > 15 else ''}")
 
     candidates.sort(key=lambda x: x[1], reverse=True)
     top_n = scouting_cfg.get("top_n", 10)
@@ -280,6 +290,7 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
                 result["factors"].append({"code": "sma_cross", "direction": "bearish"})
 
     except Exception as e:
+        print(f"[ERRORE] Analisi quantitativa di {ticker} fallita: {e}")
         result["reasons"].append(f"Errore durante l'analisi quantitativa: {e}")
 
     return result
@@ -300,6 +311,7 @@ def check_relevant_news(ticker: str, cfg: dict) -> dict:
         try:
             feed = feedparser.parse(feed_info["url"])
         except Exception as e:
+            print(f"[ATTENZIONE] Impossibile leggere il feed {feed_info['name']}: {e}")
             result["reasons"].append(f"Impossibile leggere il feed {feed_info['name']}: {e}")
             continue
 
@@ -652,7 +664,7 @@ def resolve_pending_predictions(cfg: dict):
             period="5d",
             interval="1d",
             group_by="ticker",
-            threads=True,
+            threads=False,  # vedi nota in scout_top_movers: evita "database is locked" su Ubuntu
             progress=False,
         )
     except Exception as e:
@@ -666,7 +678,8 @@ def resolve_pending_predictions(cfg: dict):
             df = df.dropna()
             if not df.empty:
                 current_prices[t] = float(df["Close"].iloc[-1])
-        except Exception:
+        except Exception as e:
+            print(f"[ATTENZIONE] Prezzo di risoluzione non disponibile per {t}: {e}")
             continue
 
     resolved_count = 0

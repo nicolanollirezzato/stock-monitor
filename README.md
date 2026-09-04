@@ -241,6 +241,42 @@ giornata), quindi qualche chiamata a Yahoo Finance in più con il passare
 delle ore. Per l'uso personale a cui è pensato lo strumento non dovrebbe
 essere un problema, ma è bene saperlo.
 
+### Affidabilità: errori Yahoo Finance ora visibili, non più silenziosi
+
+**Problema risolto**: yfinance usa una cache SQLite interna che, quando si
+scaricano molti titoli in parallelo (`threads=True`), può bloccarsi con
+errori `database is locked` — un problema noto e documentato della
+libreria, che si presenta in particolare su Ubuntu (il sistema operativo
+usato da GitHub Actions). Quando questo accadeva durante l'analisi
+dettagliata di un titolo, l'errore veniva **inghiottito silenziosamente**:
+il titolo risultava con "Punteggio totale: 0", identico in tutto e per
+tutto a un titolo genuinamente calmo, senza nessuna traccia nei log.
+
+**Correzione**:
+1. Le chiamate "bulk" (scouting e risoluzione delle previsioni) ora usano
+   `threads=False`: più lente ma non soggette al blocco del database.
+2. Ogni fallimento nel recupero dati per un singolo titolo viene ora
+   **stampato esplicitamente nei log** dell'esecuzione (cercalo con
+   `[ERRORE]` o `[ATTENZIONE]`), invece di produrre silenziosamente un
+   "nessun segnale" indistinguibile da un mercato davvero calmo.
+
+**Nota sui tempi**: disattivare il parallelismo rende lo scouting
+sull'intero S&P 500 più lento (da pochi secondi a probabilmente qualche
+decina di secondi in più). Se in futuro dovesse risultare troppo lento per
+la cadenza a 5 minuti, si può valutare un compromesso (es. un numero
+limitato di thread invece di disattivarli del tutto).
+
+### Nota minore: lista S&P 500 da Wikipedia bloccata (403)
+
+Nei log potresti vedere "Impossibile scaricare la lista S&P 500 da
+Wikipedia: HTTP Error 403 Forbidden" — Wikipedia blocca le richieste che
+non sembrano provenire da un browser. Non è un problema bloccante: lo
+strumento usa automaticamente la lista di riserva statica (50 titoli
+principali), quindi lo scouting continua a funzionare, solo su un
+universo più ristretto e meno aggiornato nel tempo rispetto all'intero
+indice. Se in futuro vuoi che la lista live torni a funzionare, si può
+correggere aggiungendo un User-Agent alla richiesta.
+
 ## 7. Attiva entrambi i workflow
 
 1. Vai nella tab **Actions** del repository.
