@@ -37,14 +37,15 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
         run: python main.py
 
-      - name: Salva lo storico delle previsioni
+      - name: Salva lo storico e la cache dello scouting
         run: |
           mkdir -p data
-          touch data/alerts_log.jsonl
+          touch data/alerts_log.jsonl data/scouting_cache.json data/health_log.jsonl
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/alerts_log.jsonl
+          git add data/alerts_log.jsonl data/scouting_cache.json data/health_log.jsonl
           git diff --cached --quiet || git commit -m "Aggiorna storico previsioni [skip ci]"
           git push || echo "Push non riuscito (probabile esecuzione concorrente): si riproverà al prossimo ciclo."
