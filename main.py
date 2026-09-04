@@ -195,7 +195,10 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
     try:
         tk = yf.Ticker(ticker)
 
-        intraday = tk.history(period="2d", interval="5m")
+        # prepost=True: include pre-market/after-hours, altrimenti i dati
+        # restano "congelati" all'ultima sessione regolare fuori dall'orario
+        # 9:30-16:00 ET (causa della staleness segnalata).
+        intraday = tk.history(period="2d", interval="5m", prepost=True)
         daily = tk.history(period="60d", interval="1d")
 
         if intraday.empty or daily.empty:
@@ -232,8 +235,14 @@ def analyze_price_and_volume(ticker: str, cfg: dict) -> dict:
             result["factors"].append({"code": "price_1d", "direction": fdir})
 
         # --- Fattore 3: volume anomalo (corretto per l'orario di borsa) ---
-        avg_volume = daily["Volume"].iloc[:-1].mean()
-        today_volume = daily["Volume"].iloc[-1]
+        # Sommiamo le barre di OGGI dalla serie intraday (ora con
+        # prepost=True): la riga "oggi" dei dati giornalieri non si
+        # aggiornava fuori dalla sessione regolare, restando congelata.
+        last_bar_date = intraday.index[-1].date()
+        today_intraday = intraday[intraday.index.date == last_bar_date]
+        today_volume = float(today_intraday["Volume"].sum())
+
+        avg_volume = daily["Volume"].iloc[:-1].mean()  # media storica di sessione regolare, invariata
         expected_volume_by_now = avg_volume * trading_day_fraction_elapsed()
         if expected_volume_by_now > 0:
             volume_ratio = today_volume / expected_volume_by_now

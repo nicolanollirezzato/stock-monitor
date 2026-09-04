@@ -178,27 +178,45 @@ Ogni voce dello storico include, oltre a direzione/prezzo/esito:
 
 **Problema risolto**: i dati storici a barre (`tk.history()`), senza
 l'opzione `prepost=True`, NON includono le contrattazioni pre-market e
-after-hours — il prezzo restava quindi "congelato" all'ultima chiusura di
-sessione regolare finché il mercato non riapriva, e gli alert generati in
-quelle fasce orarie mostravano un prezzo non aggiornato.
+after-hours — il prezzo (e il volume) restavano quindi "congelati"
+all'ultima sessione regolare finché il mercato non riapriva. Questo non
+riguardava solo il prezzo mostrato nei messaggi, ma **anche i fattori
+stessi della checklist** ("Variazione giornaliera" e "Volume anomalo"),
+che di conseguenza non si ricalcolavano correttamente da un ciclo
+all'altro fuori dall'orario di mercato regolare.
 
-**Correzione**: il prezzo mostrato nei messaggi ora viene recuperato
-dall'endpoint di **quotazione** di Yahoo Finance (non quello storico), che
-espone il campo `marketState` (PRE/REGULAR/POST) insieme ai prezzi
-specifici di ciascuna fase — pre-market, after-hours o sessione regolare —
-usando sempre quello del segmento effettivamente in corso.
+**Correzione (due parti)**:
+1. I dati intraday usati dalla checklist ora includono `prepost=True`, così
+   riflettono le contrattazioni pre-market/after-hours invece di restare
+   fermi all'ultima chiusura regolare. Questo corregge alla radice sia il
+   fattore "Variazione giornaliera" sia il fattore "Movimento 5 minuti" —
+   e di conseguenza anche il **punteggio checklist**, che ora si ricalcola
+   correttamente ad ogni ciclo anche fuori orario di mercato regolare.
+2. Il fattore "Volume anomalo" ora somma le barre intraday di **oggi**
+   (che includono pre/after-market) invece di leggere la singola riga
+   "oggi" dei dati giornalieri, che non si aggiornava fuori sessione regolare.
+3. Il prezzo mostrato nei messaggi (separatamente) viene recuperato
+   dall'endpoint di **quotazione** di Yahoo Finance (campo `marketState` +
+   prezzo pre-market/after-hours/regolare dedicato), per un valore ancora
+   più istantaneo di quanto forniscano le barre a 5 minuti.
 
-Ogni messaggio ora mostra **due variazioni distinte**:
+Ogni messaggio mostra **due variazioni distinte**:
 - **Variazione da apertura**: rispetto al prezzo di apertura della sessione
   regolare odierna (presente sia nel primo segnale che negli aggiornamenti)
 - **Variazione dall'ultimo rilevamento**: solo negli aggiornamenti, rispetto
-  all'ultima volta che quel titolo è stato analizzato in giornata (l'ultimo
-  aggiornamento se ce n'è già stato uno, altrimenti il primo segnale) — è un
+  all'ultima volta che quel titolo è stato analizzato in giornata — è un
   confronto "incrementale", non cumulato dall'inizio della giornata
 
 Se la quotazione istantanea non fosse disponibile per qualche motivo (rete,
 ticker non riconosciuto), il bot ripiega automaticamente sul prezzo dei dati
 storici, con un avviso nei log dell'esecuzione.
+
+**Limite residuo non completamente verificabile**: non è possibile
+escludere che, nei primissimi minuti prima che Yahoo crei la riga "di oggi"
+nei dati giornalieri, il valore di apertura (`today_open`) usato come
+riferimento per "Variazione da apertura" rifletta ancora quello di ieri
+anziché quello odierno. È un caso limite difficile da verificare senza
+osservare il comportamento durante una vera sessione di pre-market.
 
 ## 7. Attiva entrambi i workflow
 
